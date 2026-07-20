@@ -137,6 +137,7 @@ def cmd_adopt(args: argparse.Namespace) -> None:
         state["pr"] = pr
         state["status"] = "in-review"
         _save_state(issue, body, state)
+        github.link_pr_to_feature(pr, issue)
         github.comment(issue, f"🔗 Linked PR #{pr}.")
 
     print(f"Adopted existing branch '{name}'")
@@ -162,6 +163,9 @@ def cmd_pr(args: argparse.Namespace) -> None:
     state["pr"] = args.number
     state["status"] = "in-review"
     _save_state(issue, body, state)
+    # Native link: `Part of #<issue>` in the PR body so GitHub shows the connection in the PR
+    # sidebar and the issue timeline — not just a comment that no linked-issues view reads.
+    github.link_pr_to_feature(args.number, issue)
     github.comment(issue, f"🔗 Linked PR #{args.number}.")
     print(f"Linked PR #{args.number} to feature #{issue}")
 

@@ -5,6 +5,7 @@ The `addSubIssue` mutation is still preview-ish; its behavior is pinned here.
 """
 
 import json
+import re
 
 from .shell import run
 
@@ -88,6 +89,28 @@ def open_pr_for_branch(branch: str) -> int | None:
         ["gh", "pr", "list", "--head", branch, "--state", "open", "--json", "number", "--jq", ".[0].number // empty"]
     )
     return int(out) if out else None
+
+
+_FEATURE_REF_RE = re.compile(r"(?mi)^Part of #\d+\s*$")
+
+
+def link_pr_to_feature(pr: int, issue: int) -> bool:
+    """Add a native `Part of #<issue>` reference to the PR body, creating a real GitHub link
+    that shows in the PR's sidebar and the issue's timeline. Returns True if the body changed.
+
+    Non-closing on purpose: the feature (umbrella) issue outlives the PR — it's closed by
+    `feature merge` once the gate is clean, not automatically when the PR merges. A `Closes`
+    keyword would wrongly auto-close the tracking issue (and all its still-open problem
+    sub-issues stay open). We strip any stale `Part of #…` line first so re-linking to a
+    different issue doesn't leave two references behind.
+    """
+    body = run(["gh", "pr", "view", str(pr), "--json", "body", "--jq", ".body"])
+    if re.search(rf"(?mi)^Part of #{issue}\s*$", body):
+        return False  # already linked to this issue
+    stripped = _FEATURE_REF_RE.sub("", body).rstrip()
+    new_body = f"{stripped}\n\nPart of #{issue}\n" if stripped else f"Part of #{issue}\n"
+    run(["gh", "pr", "edit", str(pr), "--body-file", "-"], input_text=new_body)
+    return True
 
 
 def pr_base_branch(number: int) -> str:
