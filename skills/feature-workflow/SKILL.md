@@ -1,6 +1,6 @@
 ---
 name: feature-workflow
-description: Manage parallel feature development with branches, worktrees, PRs, and GitHub-issue-backed review tracking with a merge gate. Use when the user wants to start a new feature, stack a feature on another, adopt an existing branch into tracking, run a tracked code review that files problems as issues, check whether a feature is safe to merge, or resume work on a feature branch and needs its status. Trigger phrases include "start a feature", "new feature branch", "stack this on", "adopt this branch", "review this feature", "can I merge", "what's the status of this branch", "feature gate".
+description: Manage parallel feature development with branches, worktrees, PRs, and GitHub-issue-backed review tracking with a merge gate. Use when the user wants to start a new feature, stack a feature on another, adopt an existing branch into tracking, run a tracked code review that files problems as issues, check whether a feature is safe to merge, or resume work on a feature branch and needs its status. On a branch tracked by this workflow (one with a wired feature issue), this skill OWNS reviewing — any request to "run a review", "review this", "do a code review", or "review the PR" while on a tracked feature branch means this skill's review flow (finder subagent → dedup → file problems → record the run so the gate moves), NOT a standalone/generic code reviewer and NOT a search for a project-local code-review skill. Trigger phrases include "start a feature", "new feature branch", "stack this on", "adopt this branch", "run a review", "review this", "review the PR", "review this feature", "can I merge", "what's the status of this branch", "feature gate".
 ---
 
 # Feature workflow
@@ -67,8 +67,13 @@ when asked to review:
    both halves: it refuses to run with no PR linked, AND if the PR's base branch ≠ the feature's
    tracked parent (so a PR mistakenly opened against `main` is caught, not silently mis-scoped).
 2. **Run the finder in a fresh subagent — FIRST, before loading any tracked state** — spawn one
-   subagent (`Agent` tool) whose whole job is to invoke `Skill(code-review, <PR#>)` (optionally
-   add `--effort high`) on the linked PR and return the raw findings. The PR number scopes the
+   subagent (`Agent` tool) whose whole job is to review the linked PR and return the raw
+   findings. It reviews the PR with the **built-in reviewer**: invoke `Skill(review, <PR#>)`
+   (the built-in "Review a GitHub pull request" skill; optionally add `--effort high`). Do NOT
+   go hunting for a project-local `code-review` *skill* — there isn't one (a custom navari
+   `code-review` skill was retired in favour of the built-in). `/code-review` also exists as a
+   built-in slash *command* but reviews the local working diff, not a PR by number; for this
+   flow the PR-scoped `Skill(review, <PR#>)` is the correct call. The PR number scopes the
    diff against its base — correct by construction for stacked branches. Because you haven't
    loaded the problem list or prior-review context yet, there is nothing to accidentally hand it
    — it finds blind. Same on the first review of the session or the fifth. Never run the finder

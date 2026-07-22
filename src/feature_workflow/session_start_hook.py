@@ -47,6 +47,20 @@ def main() -> None:
 
     print("<feature-context>")
     print(buf.getvalue().rstrip())
+    print()
+    # Steer review requests into the tracked flow. Without this, a bare "run a review" on a
+    # tracked branch gets served by whatever generic reviewer the model reaches for first — it
+    # never loads the feature-workflow skill, so the finding never becomes a tracked problem and
+    # the merge gate never moves. Naming the skill explicitly (not just its trigger phrases)
+    # makes the routing deterministic regardless of skill auto-matching.
+    print(
+        "This branch is a TRACKED FEATURE. Any request to review it, record a review, file a "
+        "problem, check the merge gate, or resume its status MUST go through the "
+        "`feature-workflow` skill — invoke `Skill(feature-workflow)` and follow it. In "
+        "particular, 'run a review' / 'review this' means the feature-workflow review flow "
+        "(finder subagent → dedup → `feature problem add` → `feature review record`), NOT a "
+        "standalone code reviewer and NOT a search for a project-local `code-review` skill."
+    )
     print("</feature-context>")
 
 

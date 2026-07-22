@@ -155,7 +155,7 @@ the parent session does dedup + recording. The split matters:
 ```
 agent session ─▶ spawn finder SUBAGENT (PR# only — NO tracked state loaded yet)
                     │                    │
-                    │            Skill(code-review, <PR#>) ─▶ raw findings returned to parent
+                    │            Skill(review, <PR#>) ─▶ raw findings returned to parent
                     ▼
    parent NOW loads tracked state, and for each finding decides BOTH (real code + open problems):
        ├─ reproducible?  no ─▶ drop (false positive)
