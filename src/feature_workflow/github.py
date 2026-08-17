@@ -12,9 +12,11 @@ from .shell import run
 LABELS = [
     ("feature", "0e8a16", "Feature tracking issue"),
     ("problem", "d93f0b", "Review-found problem"),
-    ("sev:high", "b60205", "High severity problem"),
-    ("sev:med", "fbca04", "Medium severity problem"),
-    ("sev:low", "0e8a16", "Low severity problem"),
+    ("sev:high", "b60205", "High severity problem (blocks the merge gate)"),
+    ("sev:med", "fbca04", "Medium severity problem (blocks the merge gate)"),
+    ("sev:low", "0e8a16", "Low severity problem (tracked debt, does not block)"),
+    ("deferred", "c5def5", "Real problem, deliberately not fixed in this PR (reason on the issue)"),
+    ("rejected", "cfd3d7", "Not a real problem — false positive or by design (reason on the issue)"),
 ]
 
 
@@ -121,6 +123,38 @@ def pr_base_branch(number: int) -> str:
     if not out:
         raise ValueError(f"Could not resolve base branch for PR #{number}")
     return out
+
+
+def pr_diff_stats(number: int) -> tuple[int, int]:
+    """(changed_files, changed_lines) for a PR — the size half of review-budget sizing."""
+    out = run(
+        [
+            "gh",
+            "pr",
+            "view",
+            str(number),
+            "--json",
+            "changedFiles,additions,deletions",
+            "--jq",
+            "[.changedFiles, (.additions + .deletions)] | @tsv",
+        ]
+    )
+    files, lines = out.split("\t")
+    return int(files), int(lines)
+
+
+def pr_changed_paths(number: int) -> list[str]:
+    """Repo-relative paths the PR touches — the sensitivity half of review-budget sizing.
+
+    Scoped by the PR's own base, like every other view of the diff in this workflow.
+    """
+    out = run(["gh", "pr", "diff", str(number), "--name-only"])
+    return out.splitlines() if out else []
+
+
+def add_label(number: int, label: str) -> None:
+    """Add a label to an issue (used to stamp a problem's recorded disposition)."""
+    run(["gh", "issue", "edit", str(number), "--add-label", label])
 
 
 def get_issue_body(number: int) -> str:

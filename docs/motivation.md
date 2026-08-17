@@ -34,11 +34,12 @@ config get-parent` / `git town branch` read it back and render the full stack. `
 is likewise a thin wrapper over `git town sync` (recursive ancestor sync); we do **not**
 implement restacking ourselves.
 
-**The merge gate is a pure function of two conditions:** zero open problems AND the last review
-found zero new problems. The second condition is the subtle one — it forces at least one clean
-review pass *after* the last fix, so a fix that introduces a new bug can't slip through. This is
-also why `feature sync` clears `last_review` when the base advances: the prior clean pass no
-longer covers the newly merged code.
+**The merge gate is a pure function** of the blocking-problem count and the last review. The
+"clean pass after the last fix" condition is the subtle one — it forces at least one clean review
+*after* the final fix, so a fix that introduces a new bug can't slip through. This is also why
+`feature sync` clears `last_review` when the base advances: the prior clean pass no longer covers
+the newly merged code. (The condition started as "the last review found *nothing*", which never
+terminated — see course-correction 5.)
 
 **Abort-fast, never hide problems.** Every subprocess wrapper crashes loudly rather than
 returning an empty/default result. This earned its keep repeatedly: when a review subprocess
@@ -87,8 +88,35 @@ the finder in a fresh **subagent** (a sub-task of the live session process — s
 the session manager to reap), passing only the diff scope and *not* the tracked-problem list, so every run finds
 blind. The parent keeps dedup + recording, because that half genuinely needs the tracked state.
 
-The through-line of all three: **don't reimplement or spawn what the surrounding tools already
-provide.** Delegate stacking to git-town, reviewing to `/code-review`, and run the review in the
+**5. "Zero findings" gate → severity-aware, budgeted, tri-state gate.** The gate originally
+demanded a review run that found *nothing at all*. In practice that state never arrived: the
+reviewer is built to report at every altitude, so every round returned nits, plausible-but-unproven
+issues, and pre-existing problems in files the PR merely touched. Fixing those produced a new round
+with new findings, forever — and each round is the most expensive operation in the workflow. The
+only exit was `feature merge --force`, which recorded no rationale, so the real decision ("this is
+good enough") happened off the record.
+
+The correction has four parts, and the important thing is *which* part is the fix: **severity is**.
+Only `sev:high`/`sev:med` hold the gate now, and the clean-pass condition became
+`new_blocking == 0` rather than `findings == 0` — which is all the original safety property ("a fix
+must not introduce a new defect") ever required. The rest supports it: **dispositions**
+(`defer`/`reject`, each with a reason posted on the sub-issue) give "ship it anyway" and "that's a
+false positive" first-class, auditable forms instead of `--force`; a **review budget** (2–4 rounds,
+auto-sized from diff size and repo-declared sensitive paths) bounds the spend; and a **third
+verdict**, `NEEDS_DECISION`, makes "stop and let a human choose — ship, split, or redesign" a
+machine-visible outcome, reached either when the budget is spent or early when the loop is visibly
+churning (findings not decreasing, or fixes re-opening closed problems).
+
+Two things we considered and did *not* do. We didn't make deferral close the problem or spin out a
+duplicate follow-up issue — deferred problems stay open, keep their real severity, and get named in
+the merge comment, because debt you can't see isn't tracked and two issues for one bug drift.
+And we didn't add per-round scope narrowing (review only the fix commits on rounds 2+) even though
+it would roughly halve the tokens: it trades away the property that makes stacked reviews correct by
+construction — the finder gets a PR *number*, and the PR's base defines the diff. That one is still
+open, deliberately.
+
+The through-line of all three subprocess/reviewer corrections: **don't reimplement or spawn what the
+surrounding tools already provide.** Delegate stacking to git-town, reviewing to `/code-review`, and run the review in the
 session that's already open.
 
 ## Process notes
@@ -108,3 +136,7 @@ session that's already open.
 - Mirroring problems to PR review threads (native resolved-thread UX).
 - Versioning state in git (an orphan `feature-state` branch) as a diffable backup — Issues +
   their API history cover the current need.
+- Scoping middle review rounds to the fix commits (`<last_review.sha>..HEAD`) instead of the whole
+  PR, with a full-scope final round. Roughly halves the tokens of a 3-round feature, but it breaks
+  the "hand the finder a PR number" invariant that makes stacked-branch scope correct by
+  construction. Worth revisiting if review cost becomes the binding constraint.

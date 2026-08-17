@@ -61,6 +61,15 @@ def main() -> None:
         "(finder subagent → dedup → `feature problem add` → `feature review record`), NOT a "
         "standalone code reviewer and NOT a search for a project-local `code-review` skill."
     )
+    # The gate line above already says what to do; make the stop condition explicit, because the
+    # failure mode this replaced was an agent reviewing round after round chasing a clean sweep.
+    print(
+        "The gate above is authoritative about whether to review again: REVIEW_AGAIN means fix "
+        "the blocking problems and run ONE more review round; NEEDS_DECISION means STOP "
+        "reviewing and `feature escalate --reason '<recommendation>'` for a human. Only "
+        "high/med problems block — never downgrade a severity to open the gate, use "
+        "`feature problem defer <#> --reason '<why>'` so the decision is recorded."
+    )
     print("</feature-context>")
 
 

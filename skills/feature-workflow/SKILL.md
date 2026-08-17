@@ -7,8 +7,10 @@ description: Manage parallel feature development with branches, worktrees, PRs, 
 
 Drives the `feature` CLI (globally installed; repo at `/Users/kbww511/git/feature-workflow`).
 Each feature = a branch + worktree + a GitHub tracking issue holding machine-readable state.
-Review-found problems become sub-issues; a **merge gate** opens only when all problems are
-resolved AND the last review found nothing new. Full design: that repo's `docs/design.md`.
+Review-found problems become sub-issues; a **merge gate** opens when nothing *blocking* is left
+and the last review found no new blocking problems. Reviews are budgeted, and when the loop
+stops converging the gate says **NEEDS_DECISION** instead of asking for another round forever.
+Full design: that repo's `docs/design.md`.
 
 ## When to use which command
 
@@ -23,14 +25,19 @@ config, so any session on the branch can reconstruct it.
 | Record what you were asked to do | `feature prompt "<the request>"` |
 | Link the PR after opening it | `feature pr <number>` (required before any review) |
 | Run a code review that files problems | **in-session** — see "Reviewing a feature" below (needs a linked PR; there is no headless review subcommand) |
-| Record an in-session review so the gate moves | `feature review record --sha <sha> --new <count> --summary "<one line>"` |
-| See open problems | `feature problem list --open` |
+| Record an in-session review so the gate moves | `feature review record --sha <sha> --new-blocking <n> [--new-low <n>] [--regressions <n>] --summary "<one line>"` |
+| See what actually blocks the merge | `feature problem list --blocking` (or `--open` for everything open) |
 | File a problem you found | `feature problem add --title "<t>" --sev <high\|med\|low> [--body "<detail>" \| --body-file <path\|->]` |
 | Mark a problem fixed | `feature problem resolve <issue#> --commit <sha>` |
+| Ship a real problem unfixed (on the record) | `feature problem defer <issue#> --reason "<why it's acceptable>"` |
+| Kill a false positive (on the record) | `feature problem reject <issue#> --reason "<why it isn't real>"` |
+| See / change how many review rounds this feature gets | `feature budget` (`--set <n>` to override, `--auto` to go back to diff-sized) |
+| Hand a non-converging loop to a human | `feature escalate --reason "<what you found + what you recommend>"` |
 | Sync branch with base (recursive) | `feature sync` (or `--stack` for the whole stack) — delegates to git-town; reopens the gate if the base moved |
-| Check if safe to merge | `feature gate` (exit 0 = open) |
+| Check if safe to merge | `feature gate` — **exit 0 = OPEN (ship), 1 = REVIEW_AGAIN, 2 = NEEDS_DECISION (stop, ask the human)** |
 | After merging, close out | `feature merge` |
 | Resume / understand a branch | `feature status` |
+| A feature issue written by an older CLI | `feature migrate` (one-way state-block upgrade) |
 
 ## Starting a session on an existing branch
 
@@ -94,14 +101,27 @@ when asked to review:
      anything you can't concretely reproduce — a false positive must never close the gate.
    - **duplicate?** Judge by *meaning*, not wording (the same bug is titled differently every
      review). Matches an OPEN problem → skip it. Matches a CLOSED problem → **regression**:
-     reopen it (`gh issue reopen <#>`) and count it as new. No match → genuinely new.
+     reopen it (`gh issue reopen <#>`) and count it in both `--new-blocking` (if it is
+     high/med) and `--regressions`. No match → genuinely new.
+   - **caused by THIS PR?** If the finding is a pre-existing issue in a file the PR merely
+     touches, or an adjacent improvement the PR didn't create, it is **never blocking** — file
+     it `--sev low`, or file it and `feature problem defer <#> --reason "pre-existing, not
+     introduced by this PR"`. This rule matters: a reviewer wandering outside the diff is a
+     large share of why review loops never end.
+   - **severity** — this is now load-bearing, so assign it honestly:
+     - `high` — data loss, security hole, crash, or a silently wrong result on a realistic path.
+     - `med` — a real bug on a narrower path, or a correctness/robustness defect that will bite.
+     - `low` — style, naming, duplication, altitude, hypotheticals, anything you couldn't tie to
+       a concrete failure. **Low never blocks the merge.**
 5. **File the genuinely-new ones** — `feature problem add --title "…" --sev high|med|low`, putting
    the concrete failure scenario + `file:line` in the body. The body is usually multi-line and
    has code snippets, so pipe it via `--body-file -` (`… --body-file - <<'EOF' … EOF`) rather
    than `--body "…"`, which mangles backticks/quotes/newlines through the shell.
 6. **Record the run so the gate moves** — `feature review record --sha $(git rev-parse HEAD)
-   --new <count-of-new-plus-regressed> --summary "<one line>"`. Skipping this leaves the gate
-   at "no review run recorded" even after you've filed problems.
+   --new-blocking <high+med filed, plus blocking regressions> --new-low <lows filed>
+   --regressions <closed problems reopened> --summary "<one line>"`. Skipping this leaves the gate
+   at "no valid review run recorded" even after you've filed problems. The command prints the
+   resulting gate verdict and your next step — **read it and obey it** (see below).
    - The `--summary` must be a **real sentence derived from the review**, not boilerplate — draw
      it from the finder subagent's returned conclusion plus your dedup result. The `code-review`
      skill's structured result is an empty findings array on a clean pass (no prose), so the
@@ -113,10 +133,42 @@ when asked to review:
      pass" is not acceptable — an empty findings array plus a boilerplate summary is
      indistinguishable from a review that silently did nothing.
 
-Then the loop: fix each problem → `feature problem resolve <#> --commit <sha>` → review
-in-session again → `feature review record …`. The gate stays closed until a review records
-**zero new** problems (this forces a clean pass after your last fix). When `feature gate` exits
+Then the loop: fix each blocking problem → `feature problem resolve <#> --commit <sha>` → review
+in-session again → `feature review record …`. The gate stays closed until a review records **zero
+new blocking** problems (this forces a clean pass after your last fix). When `feature gate` exits
 0, the human merges.
+
+## When to stop reviewing (the part that used to loop forever)
+
+A reviewer always finds *something*, so "review until a run comes back empty" never terminates.
+The gate therefore has three verdicts, and reviews are budgeted. **Let the verdict drive you** —
+don't decide on vibes, and don't launch another finder subagent without one telling you to:
+
+| `feature gate` | Exit | What you do |
+| --- | --- | --- |
+| `OPEN` | 0 | Report that it's safe to merge, name the debt that ships, stop. The human merges. |
+| `REVIEW_AGAIN` | 1 | Fix the blocking problems, then run **one** more review round. |
+| `NEEDS_DECISION` | 2 | **STOP. Do not run another review.** `feature escalate --reason "…"` and hand the human a recommendation. |
+
+`NEEDS_DECISION` fires when the review budget (2–4 rounds, auto-sized from diff size and whether
+the PR touches paths the repo marked sensitive) is spent, or earlier when the loop is visibly not
+converging — blocking findings stopped decreasing, or a round re-opened problems that were already
+fixed once. When you escalate, recommend exactly one of:
+
+- **Ship it** — the remainder is genuinely acceptable debt. Say which problems and why, and defer
+  them (`feature problem defer <#> --reason "…"`) so the decision is on the record.
+- **Buy another round** — you have a specific reason to believe one more pass converges
+  (`feature budget --set <n>`). Don't use this to avoid making a call.
+- **Split the PR** — the diff is too big to converge; land the settled part, move the rest out.
+- **Redesign** — repeated regressions in the same area mean the approach is wrong, not the code.
+
+Three rules that keep this honest:
+
+- **Never lower a severity to open the gate.** If a high/med problem should ship unfixed, `defer`
+  it with a reason — same outcome, but the decision is attributable instead of hidden in a label.
+- **Never `feature merge --force`** to get around a closed gate. Escalate; the human decides.
+- **Deferred and low problems stay OPEN on purpose** and are listed in the merge comment. Debt you
+  can't see isn't tracked.
 
 ## Rules
 
