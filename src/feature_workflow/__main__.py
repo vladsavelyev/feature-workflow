@@ -87,6 +87,23 @@ def _triage(issue: int) -> problems.Triage:
     return problems.triage(github.sub_issues(issue))
 
 
+def _require_problem(branch: str, number: int) -> dict:
+    """Return `number` as a problem sub-issue of this feature, aborting if it isn't one.
+
+    Resolving and disposing edit exactly the state the gate reads. Pointed at the wrong number —
+    a typo, a PR number, the feature issue itself — they would quietly change what blocks a merge
+    or close something unrelated. One API call to rule it out is worth it.
+    """
+    parent = _resolve_issue(branch)
+    sub = next((s for s in github.sub_issues(parent) if s["number"] == number), None)
+    if sub is None:
+        sys.exit(
+            f"#{number} is not a problem sub-issue of feature #{parent} — refusing to touch it. "
+            f"Run `feature problem list` to see this feature's problems."
+        )
+    return sub
+
+
 # ── commands ────────────────────────────────────────────────────────────────
 
 
@@ -276,6 +293,7 @@ def cmd_problem_add(args: argparse.Namespace) -> None:
 
 
 def cmd_problem_resolve(args: argparse.Namespace) -> None:
+    _require_problem(args.branch or current_branch(), args.number)
     note = f"Fixed in {args.commit}." if args.commit else "Resolved."
     github.close_issue(args.number, note)
     print(f"Resolved problem #{args.number}")
@@ -288,21 +306,23 @@ def cmd_problem_defer(args: argparse.Namespace) -> None:
     keeps its severity (so nobody has to lie about how bad it is) and gains a `deferred` label
     plus a reason on its timeline, which is what makes shipping it a decision rather than a leak.
     """
+    sub = _require_problem(args.branch or current_branch(), args.number)
     github.add_label(args.number, problems.DEFERRED)
     github.comment(args.number, f"⏸ Deferred — not fixed in this PR, no longer blocking: {args.reason}")
-    print(f"Deferred problem #{args.number} (still open, no longer blocking)")
+    print(f"Deferred problem #{args.number} [{problems.severity(sub)}] (still open, no longer blocking)")
 
 
 def cmd_problem_reject(args: argparse.Namespace) -> None:
     """Not a real problem (false positive or by design): closed with the reasoning recorded."""
+    _require_problem(args.branch or current_branch(), args.number)
     github.add_label(args.number, problems.REJECTED)
     github.close_issue(args.number, f"🚫 Rejected — not a real problem: {args.reason}")
     print(f"Rejected problem #{args.number}")
 
 
 def _problem_line(sub: dict) -> str:
-    disposition = problems.disposition(sub)
-    mark = "BLOCKING" if problems.is_blocking(sub) else (disposition or "non-blocking")
+    disposed = problems.disposition(sub)
+    mark = "BLOCKING" if problems.is_blocking(sub) else (disposed or "non-blocking")
     return f"  #{sub['number']:>5}  {sub['state']:<6}  {problems.severity(sub):<9}  {mark:<12}  {sub['title']}"
 
 
@@ -601,14 +621,17 @@ def build_parser() -> argparse.ArgumentParser:
     pr = psub.add_parser("resolve", help="Close a problem sub-issue")
     pr.add_argument("number", type=int)
     pr.add_argument("--commit")
+    pr.add_argument("--branch")
     pr.set_defaults(func=cmd_problem_resolve)
     pd = psub.add_parser("defer", help="Real problem, not fixed here: keep it open but non-blocking")
     pd.add_argument("number", type=int)
     pd.add_argument("--reason", required=True, help="Why it is acceptable to ship without fixing this")
+    pd.add_argument("--branch")
     pd.set_defaults(func=cmd_problem_defer)
     pj = psub.add_parser("reject", help="Not a real problem (false positive / by design): close it")
     pj.add_argument("number", type=int)
     pj.add_argument("--reason", required=True, help="Why this is not a real problem")
+    pj.add_argument("--branch")
     pj.set_defaults(func=cmd_problem_reject)
     pl = psub.add_parser("list", help="List problem sub-issues")
     pl.add_argument("--open", action="store_true", help="Only open problems")
