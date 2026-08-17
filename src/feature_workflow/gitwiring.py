@@ -110,6 +110,19 @@ def local_only_commits(base: str, cwd: str | None = None) -> list[str]:
     return out.splitlines() if out else []
 
 
+def sensitive_patterns(cwd: str | None = None) -> list[str]:
+    """Globs the repo has declared review-sensitive, from git config (multi-valued):
+
+        git config --add feature.sensitive-path 'src/auth/*'
+
+    A PR touching one of these earns an extra review round (see `budget.py`). An unset key is a
+    legitimate "this repo declared none" — `git config` exits 1 for a missing key, which
+    `try_run` reports as None — not a swallowed failure.
+    """
+    raw = try_run(["git", "config", "--get-all", "feature.sensitive-path"], cwd=cwd)
+    return raw.splitlines() if raw else []
+
+
 def create_branch_and_worktree(name: str, base: str, cwd: str | None = None) -> str:
     """Create branch `name` off `base` in a worktree under WORKTREE_ROOT/<name>.
 

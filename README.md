@@ -3,9 +3,23 @@
 A CLI + SessionStart hook for running multiple Claude features in parallel: each feature gets
 a branch, a worktree, a PR, and a GitHub tracking issue. Features can be **stacked** on each
 other (via git-town). Review-found problems are tracked as GitHub sub-issues, and a **merge
-gate** blocks until they're all resolved and a review comes back clean. A new Claude session on
-an existing branch reconstructs full context (base branch, last prompt, last review, open
-problems) from GitHub.
+gate** blocks until the *blocking* ones are resolved and a review comes back clean. A new Claude
+session on an existing branch reconstructs full context (base branch, last prompt, last review,
+blocking problems) from GitHub.
+
+The gate has three verdicts, because "review until a run finds nothing" never terminates — a real
+reviewer always finds *something*:
+
+| `feature gate` | Exit | Meaning |
+| --- | --- | --- |
+| `OPEN` | 0 | No blocking problems, last review clean. Ship it. |
+| `REVIEW_AGAIN` | 1 | Blocking work left, review budget remains. |
+| `NEEDS_DECISION` | 2 | Budget spent, or the loop is churning. A human decides: ship the debt, split, or redesign. |
+
+Only `sev:high`/`sev:med` problems block; `sev:low` is tracked debt that ships. Anything you decide
+to ship unfixed gets an explicit, reasoned disposition (`feature problem defer`) instead of a
+silent severity downgrade, and reviews are budgeted (2–4 rounds, sized from the diff) so a
+non-converging loop ends in a recorded decision rather than unbounded spend.
 
 See [docs/design.md](docs/design.md) for the full design, and
 [docs/motivation.md](docs/motivation.md) for the design history — why it's shaped this way and
@@ -24,6 +38,12 @@ uv sync && uv run feature --help
 - [`gh`](https://cli.github.com/) authenticated (`gh auth status`).
 - [`git-town`](https://www.git-town.com/) installed (`brew install git-town`) — needed for
   restacking stacked branches. Base-branch tracking works without it.
+- Optional, per repo: declare the paths where review mistakes are expensive, so a PR touching
+  them earns an extra review round:
+  ```sh
+  git config --add feature.sensitive-path 'src/auth/*'
+  git config --add feature.sensitive-path 'migrations/*'
+  ```
 
 Reviews run **in-session** (not as a spawned `claude` subprocess): the agent already in a Claude
 Code session runs `/code-review` on the feature's **PR** in a fresh subagent so each re-run finds
@@ -38,15 +58,18 @@ review subcommand.
 feature create add-oauth --init-labels        # branch + worktree + tracking issue
 feature prompt "Add PKCE support"              # record what you asked Claude to do
 gh pr create ... && feature pr 123             # link the PR (required before any review)
-# review in-session: finder subagent runs /code-review on PR #123, parent dedups vs tracked problems, then:
+# review in-session: finder subagent reviews PR #123, parent dedups vs tracked problems, then:
 feature problem add --title "…" --sev high    # file each genuinely-new problem
-feature review record --sha $(git rev-parse HEAD) --new 3 --summary "…"
-feature problem list --open                    # see what the review found
-# ... fix problems, then:
+feature review record --sha $(git rev-parse HEAD) --new-blocking 2 --new-low 3 \
+    --summary "Token refresh race + unchecked PKCE verifier; 3 nits filed as low"
+feature problem list --blocking                # what actually holds the merge
+# ... fix the blocking ones, then:
 feature problem resolve 46 --commit abc1234
-# re-review in-session, then record a clean pass (0 new) to open the gate:
-feature review record --sha $(git rev-parse HEAD) --new 0 --summary "Re-reviewed oauth.py; #46 fixed, no new issues"
-feature gate                                   # exit 0 = safe to merge
+feature problem reject 48 --reason "verifier is validated upstream in middleware.py:40"
+# re-review, then record a clean pass (0 new blocking) to open the gate:
+feature review record --sha $(git rev-parse HEAD) --new-blocking 0 --new-low 1 \
+    --summary "Re-reviewed oauth.py; #46 fixed; one naming nit filed"
+feature gate                                   # exit 0 = safe to merge, 2 = ask a human
 ```
 
 Adopt a branch you already have:
@@ -63,14 +86,19 @@ feature adopt --init-labels
 | `feature adopt [--branch <b>] [--base <b>]` | Wire an existing branch into tracking. |
 | `feature prompt <text>` | Record the latest prompt. |
 | `feature pr <number>` | Link a PR to the feature. |
-| `feature review record --sha <s> --new <n> --summary <t>` | Record an in-session review run (moves the gate). |
-| `feature problem add --title <t> --sev <high\|med\|low>` | Add a problem sub-issue. |
-| `feature problem resolve <number> [--commit <sha>]` | Close a problem sub-issue. |
-| `feature problem list [--open]` | List problem sub-issues. |
+| `feature review record --sha <s> --new-blocking <n> [--new-low <n>] [--regressions <n>] --summary <t>` | Record an in-session review run (moves the gate) and print the resulting verdict. |
+| `feature problem add --title <t> --sev <high\|med\|low>` | Add a problem sub-issue (`high`/`med` block the gate). |
+| `feature problem resolve <number> [--commit <sha>]` | Close a problem sub-issue as fixed. |
+| `feature problem defer <number> --reason <why>` | Real problem, shipped unfixed: stays open, stops blocking, reason recorded. |
+| `feature problem reject <number> --reason <why>` | False positive / by design: closed with the reasoning. |
+| `feature problem list [--open] [--blocking]` | List problem sub-issues with severity and disposition. |
+| `feature budget [--set <n> \| --auto]` | Show or override the review-round budget. |
+| `feature escalate --reason <t>` | Park at `needs-decision` with your recommendation for a human. |
 | `feature status [--branch <b>] [--json]` | Reconstruct and print feature state. |
 | `feature sync [--branch <b>] [--stack]` | Sync the branch with its base via git-town; if the base advanced, invalidates the last review so the gate reopens. |
-| `feature gate [--branch <b>]` | Exit 0 if safe to merge, else 1. |
-| `feature merge [--branch <b>] [--force]` | Mark merged and close the issue (checks gate). |
+| `feature gate [--branch <b>]` | Exit 0 = OPEN, 1 = REVIEW_AGAIN, 2 = NEEDS_DECISION. |
+| `feature merge [--branch <b>] [--force]` | Mark merged and close the issue (checks gate; names the debt that ships). |
+| `feature migrate [--branch <b>]` | Upgrade an older feature issue's state block to the current schema. |
 
 ## SessionStart hook
 

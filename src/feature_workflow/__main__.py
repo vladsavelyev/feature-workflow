@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 from datetime import UTC, datetime
 
-from . import gate, github
+from . import budget, gate, github, problems
 from .gitwiring import (
     create_branch_and_worktree,
     current_branch,
@@ -21,15 +21,21 @@ from .gitwiring import (
     local_only_commits,
     parent_branch,
     run_head_sha,
+    sensitive_patterns,
     set_feature_issue,
     set_parent_branch,
     worktree_for_branch,
 )
 from .state import (
+    SCHEMA,
+    migrate,
     new_state,
     parse_block,
+    parse_block_raw,
     render_block,
     replace_block,
+    review_entry,
+    set_status,
 )
 
 SEV_LABELS = {"high": "sev:high", "med": "sev:med", "low": "sev:low"}
@@ -59,6 +65,26 @@ def _load_state(branch: str) -> tuple[int, dict, str]:
 def _save_state(issue: int, body: str, state: dict) -> None:
     state["updated"] = _now()
     github.set_issue_body(issue, replace_block(body, state))
+
+
+def _resolve_budget(state: dict) -> tuple[int, list[str]]:
+    """The feature's review-round budget: an explicit override, else auto-sized from the PR diff.
+
+    Auto-sizing happens at query time rather than being frozen into the state block, so a branch
+    that grows from 20 to 900 lines earns its extra round without anyone re-running a command.
+    """
+    explicit = state["review_budget"]
+    if explicit is not None:
+        return explicit, [f"explicit override: {explicit} round(s)"]
+    if state["pr"] is None:
+        return budget.BASE_ROUNDS, ["no PR linked yet, so no diff to size — base budget for now"]
+    files, lines = github.pr_diff_stats(state["pr"])
+    hits = budget.sensitive_matches(github.pr_changed_paths(state["pr"]), sensitive_patterns())
+    return budget.auto_rounds(changed_files=files, changed_lines=lines, sensitive_hits=hits)
+
+
+def _triage(issue: int) -> problems.Triage:
+    return problems.triage(github.sub_issues(issue))
 
 
 # ── commands ────────────────────────────────────────────────────────────────
@@ -193,21 +219,38 @@ def cmd_review_record(args: argparse.Namespace) -> None:
             f"'{expected_base}' (`gh pr edit {state['pr']} --base {expected_base}`), then retry."
         )
     run_num = state["review_runs"] + 1
+    entry = review_entry(
+        run=run_num,
+        sha=args.sha,
+        new_blocking=args.new_blocking,
+        new_low=args.new_low,
+        regressions=args.regressions,
+        summary=args.summary,
+    )
     state["review_runs"] = run_num
-    state["last_review"] = {
-        "run": run_num,
-        "sha": args.sha,
-        "new_problems": args.new,
-        "summary": args.summary,
-    }
+    state["review_history"].append(entry)
+    state["last_review"] = entry
     _save_state(issue, body, state)
 
-    open_count = sum(1 for s in github.sub_issues(issue) if s["state"] == "OPEN")
+    # Recording a run is exactly the moment the agent needs the verdict — whether to fix and
+    # review again, or to stop and escalate. Print it here so nobody has to know to ask.
+    triaged = _triage(issue)
+    rounds, _ = _resolve_budget(state)
+    decision = gate.evaluate(
+        blocking_open=len(triaged.blocking),
+        last_review=state["last_review"],
+        history=state["review_history"],
+        budget=rounds,
+    )
     github.comment(
         issue,
-        f"🔍 Review run {run_num} ({args.sha}): {args.new} new problem(s). {open_count} open. {args.summary}",
+        f"🔍 Review run {run_num} ({args.sha}): {args.new_blocking} new blocking, {args.new_low} new low, "
+        f"{args.regressions} regression(s). {len(triaged.blocking)} blocking open. {args.summary}\n\n"
+        f"Gate: {decision}",
     )
     print(f"Recorded review run {run_num} for #{issue}")
+    print(f"GATE {decision}")
+    print(f"  → {decision.next_step}")
 
 
 def _add_problem(parent: int, title: str, sev: str, detail: str) -> int:
@@ -238,18 +281,44 @@ def cmd_problem_resolve(args: argparse.Namespace) -> None:
     print(f"Resolved problem #{args.number}")
 
 
+def cmd_problem_defer(args: argparse.Namespace) -> None:
+    """Real problem, not fixed in this PR: stays OPEN and visible, stops holding the gate.
+
+    Deliberately not closed — deferred work is debt, and debt you can't see isn't tracked. It
+    keeps its severity (so nobody has to lie about how bad it is) and gains a `deferred` label
+    plus a reason on its timeline, which is what makes shipping it a decision rather than a leak.
+    """
+    github.add_label(args.number, problems.DEFERRED)
+    github.comment(args.number, f"⏸ Deferred — not fixed in this PR, no longer blocking: {args.reason}")
+    print(f"Deferred problem #{args.number} (still open, no longer blocking)")
+
+
+def cmd_problem_reject(args: argparse.Namespace) -> None:
+    """Not a real problem (false positive or by design): closed with the reasoning recorded."""
+    github.add_label(args.number, problems.REJECTED)
+    github.close_issue(args.number, f"🚫 Rejected — not a real problem: {args.reason}")
+    print(f"Rejected problem #{args.number}")
+
+
+def _problem_line(sub: dict) -> str:
+    disposition = problems.disposition(sub)
+    mark = "BLOCKING" if problems.is_blocking(sub) else (disposition or "non-blocking")
+    return f"  #{sub['number']:>5}  {sub['state']:<6}  {problems.severity(sub):<9}  {mark:<12}  {sub['title']}"
+
+
 def cmd_problem_list(args: argparse.Namespace) -> None:
     branch = args.branch or current_branch()
     parent = _resolve_issue(branch)
     subs = github.sub_issues(parent)
-    if args.open:
+    if args.blocking:
+        subs = [s for s in subs if problems.is_blocking(s)]
+    elif args.open:
         subs = [s for s in subs if s["state"] == "OPEN"]
     if not subs:
         print("No problems.")
         return
     for s in subs:
-        sev = next((label for label in s["labels"] if label.startswith("sev:")), "sev:?")
-        print(f"  #{s['number']:>5}  {s['state']:<6}  {sev:<9}  {s['title']}")
+        print(_problem_line(s))
 
 
 def cmd_status(args: argparse.Namespace) -> None:
@@ -260,8 +329,14 @@ def cmd_status(args: argparse.Namespace) -> None:
         print(f"Branch '{branch}' is not a tracked feature (no wired issue).")
         return
     _, state, _ = _load_state(branch)
-    subs = github.sub_issues(issue)
-    open_probs = [s for s in subs if s["state"] == "OPEN"]
+    triaged = _triage(issue)
+    rounds, rounds_why = _resolve_budget(state)
+    decision = gate.evaluate(
+        blocking_open=len(triaged.blocking),
+        last_review=state["last_review"],
+        history=state["review_history"],
+        budget=rounds,
+    )
 
     if args.json:
         print(
@@ -270,7 +345,14 @@ def cmd_status(args: argparse.Namespace) -> None:
                     "state": state,
                     "base": parent_branch(branch) or state.get("base") or "main",
                     "worktree": worktree_for_branch(branch),
-                    "open_problems": open_probs,
+                    "review_budget": {"rounds": rounds, "used": decision.rounds_used, "why": rounds_why},
+                    "gate": {
+                        "verdict": str(decision.verdict),
+                        "reasons": decision.reasons,
+                        "next_step": decision.next_step,
+                    },
+                    "blocking_problems": triaged.blocking,
+                    "non_blocking_problems": triaged.debt,
                 },
                 indent=2,
             )
@@ -288,27 +370,102 @@ def cmd_status(args: argparse.Namespace) -> None:
     print(f"Last prompt: {state['last_prompt']}")
     lr = state["last_review"]
     if lr:
-        print(f"Last review: run {lr['run']} ({lr['sha']}) — {lr['new_problems']} new — {lr['summary']}")
+        print(
+            f"Last review: run {lr['run']} ({lr['sha']}) — {lr['new_blocking']} new blocking, "
+            f"{lr['new_low']} low, {lr['regressions']} regression(s) — {lr['summary']}"
+        )
     else:
-        print("Last review: (none)")
-    print(f"Open problems ({len(open_probs)}):")
-    for s in open_probs:
-        sev = next((label for label in s["labels"] if label.startswith("sev:")), "sev:?")
-        print(f"  #{s['number']} [{sev}] {s['title']}")
+        print("Last review: (none valid)")
+    print(f"Reviews    : {decision.rounds_used}/{rounds} rounds used ({'; '.join(rounds_why)})")
+    print(f"Gate       : {decision}")
+    print(f"  → {decision.next_step}")
+    print(f"Blocking problems ({len(triaged.blocking)}):")
+    for s in triaged.blocking:
+        print(f"  #{s['number']} [{problems.severity(s)}] {s['title']}")
+    print(f"Non-blocking, open ({len(triaged.debt)}):")
+    for s in triaged.debt:
+        print(f"  #{s['number']} [{problems.severity(s)}/{problems.disposition(s) or 'open'}] {s['title']}")
 
 
-def _gate_for(branch: str) -> tuple[int, dict, gate.GateDecision]:
+def _gate_for(branch: str) -> tuple[int, dict, problems.Triage, gate.GateDecision]:
     issue, state, _ = _load_state(branch)
-    open_count = sum(1 for s in github.sub_issues(issue) if s["state"] == "OPEN")
-    return issue, state, gate.evaluate(open_count, state["last_review"])
+    triaged = _triage(issue)
+    rounds, _ = _resolve_budget(state)
+    decision = gate.evaluate(
+        blocking_open=len(triaged.blocking),
+        last_review=state["last_review"],
+        history=state["review_history"],
+        budget=rounds,
+    )
+    return issue, state, triaged, decision
 
 
 def cmd_gate(args: argparse.Namespace) -> None:
     branch = args.branch or current_branch()
-    issue, _, decision = _gate_for(branch)
+    issue, _, triaged, decision = _gate_for(branch)
     print(f"GATE {decision} (#{issue})")
-    if not decision.open:
-        sys.exit(1)
+    print(f"  → {decision.next_step}")
+    print(f"  {triaged.summary()}")
+    # Exit code is the machine interface: 0 ship, 1 review again, 2 human decision needed.
+    sys.exit(decision.exit_code)
+
+
+def cmd_budget(args: argparse.Namespace) -> None:
+    """Show — or override — how many review rounds this feature gets before a human decides."""
+    branch = args.branch or current_branch()
+    issue, state, body = _load_state(branch)
+    if args.set is not None:
+        state["review_budget"] = args.set
+        _save_state(issue, body, state)
+        github.comment(issue, f"🎚 Review budget set to {args.set} round(s).")
+    elif args.auto:
+        state["review_budget"] = None
+        _save_state(issue, body, state)
+        github.comment(issue, "🎚 Review budget back to auto-sizing from the PR diff.")
+
+    rounds, why = _resolve_budget(state)
+    used = len(gate.rounds_since_invalidation(state["review_history"]))
+    print(f"Review budget: {rounds} round(s) — {'; '.join(why)}")
+    print(f"Used         : {used} round(s) since the last base change")
+
+
+def cmd_escalate(args: argparse.Namespace) -> None:
+    """Hand the feature to a human: the review loop isn't converging on its own.
+
+    This is the recorded form of "stop and decide" — ship the remaining debt, buy another review
+    round, split the PR, or redesign. It posts the current gate state alongside the reason so the
+    human sees the evidence, and parks the feature at `needs-decision` (visible on the board).
+    """
+    branch = args.branch or current_branch()
+    issue, state, triaged, decision = _gate_for(branch)
+    body = github.get_issue_body(issue)
+    set_status(state, "needs-decision")
+    _save_state(issue, body, state)
+    blocking_refs = ", ".join(f"#{s['number']}" for s in triaged.blocking) or "none"
+    github.comment(
+        issue,
+        f"🚧 **Escalated for a human decision.** {args.reason}\n\n"
+        f"Gate: {decision}\n\n"
+        f"Blocking: {len(triaged.blocking)} — {blocking_refs}\n"
+        f"{triaged.summary()}\n\n"
+        f"Options: ship the rest as debt (`feature problem defer <#> --reason …`), buy another "
+        f"review round (`feature budget --set <n>`), split the PR, or redesign.",
+    )
+    print(f"Escalated #{issue} for a human decision; status is now needs-decision.")
+
+
+def cmd_migrate(args: argparse.Namespace) -> None:
+    """Upgrade a feature issue's state block to the current schema (one-way)."""
+    branch = args.branch or current_branch()
+    issue = _resolve_issue(branch)
+    body = github.get_issue_body(issue)
+    state = parse_block_raw(body)
+    if state.get("schema") == SCHEMA:
+        print(f"#{issue} is already at schema {SCHEMA}; nothing to do.")
+        return
+    was = state.get("schema")
+    _save_state(issue, body, migrate(state))
+    print(f"Migrated #{issue} state from schema {was} to {SCHEMA}.")
 
 
 def cmd_merge(args: argparse.Namespace) -> None:
@@ -318,15 +475,19 @@ def cmd_merge(args: argparse.Namespace) -> None:
     once the branch is merged and closes the tracking issue.
     """
     branch = args.branch or current_branch()
-    issue, state, decision = _gate_for(branch)
+    issue, state, triaged, decision = _gate_for(branch)
     if not decision.open and not args.force:
         sys.exit(f"Refusing to close #{issue}: gate {decision}. Use --force to override.")
 
-    state["status"] = "merged"
+    set_status(state, "merged")
     body = github.get_issue_body(issue)
     _save_state(issue, body, state)
-    github.close_issue(issue, "✅ Merged. All problems resolved and review clean.")
+    # Name the debt that ships. Deferred and low-severity problems stay open on purpose, and a
+    # merge note that claimed "all problems resolved" would bury exactly what someone will need
+    # to find later.
+    github.close_issue(issue, f"✅ Merged. No blocking problems; {triaged.summary()}.")
     print(f"Marked feature #{issue} merged and closed it.")
+    print(f"  {triaged.summary()}")
 
 
 def cmd_sync(args: argparse.Namespace) -> None:
@@ -341,14 +502,19 @@ def cmd_sync(args: argparse.Namespace) -> None:
     git_town_sync(stack=args.stack)
     after = run_head_sha()
 
-    if after == before and state["last_review"] is not None:
+    if after == before:
         # Base already up to date and nothing merged in — the prior review still holds.
         print(f"Already up to date ({after}); review unchanged.")
         return
 
     # The base advanced: any prior "clean" review predates the newly merged code, so drop it.
     # The gate reopens and a fresh in-session review + `feature review record` is required first.
-    stale = state["last_review"] is not None
+    # The marker in the history is load-bearing: the gate counts review rounds and reads the
+    # convergence trend only from runs AFTER it, so new base code buys a fresh round of budget
+    # instead of inheriting an exhausted one.
+    stale = bool(gate.rounds_since_invalidation(state["review_history"]))
+    if stale:
+        state["review_history"].append({"event": "base-advanced", "sha": after, "at": _now()})
     state["last_review"] = None
     body = github.get_issue_body(issue)
     _save_state(issue, body, state)
@@ -403,7 +569,19 @@ def build_parser() -> argparse.ArgumentParser:
     rsub = c.add_subparsers(dest="review_command", required=True)
     r = rsub.add_parser("record", help="Record an in-session review run (moves the gate)")
     r.add_argument("--sha", required=True)
-    r.add_argument("--new", type=int, required=True, help="Count of NEW problems found")
+    r.add_argument(
+        "--new-blocking",
+        type=int,
+        required=True,
+        help="Count of NEW high/med problems filed, plus blocking ones re-opened as regressions",
+    )
+    r.add_argument("--new-low", type=int, default=0, help="Count of NEW low-severity problems filed (non-blocking)")
+    r.add_argument(
+        "--regressions",
+        type=int,
+        default=0,
+        help="Count of previously-closed problems re-opened this run (any severity) — a churn signal",
+    )
     r.add_argument("--summary", required=True)
     r.add_argument("--branch")
     r.set_defaults(func=cmd_review_record)
@@ -424,8 +602,17 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("number", type=int)
     pr.add_argument("--commit")
     pr.set_defaults(func=cmd_problem_resolve)
+    pd = psub.add_parser("defer", help="Real problem, not fixed here: keep it open but non-blocking")
+    pd.add_argument("number", type=int)
+    pd.add_argument("--reason", required=True, help="Why it is acceptable to ship without fixing this")
+    pd.set_defaults(func=cmd_problem_defer)
+    pj = psub.add_parser("reject", help="Not a real problem (false positive / by design): close it")
+    pj.add_argument("number", type=int)
+    pj.add_argument("--reason", required=True, help="Why this is not a real problem")
+    pj.set_defaults(func=cmd_problem_reject)
     pl = psub.add_parser("list", help="List problem sub-issues")
     pl.add_argument("--open", action="store_true", help="Only open problems")
+    pl.add_argument("--blocking", action="store_true", help="Only problems that hold the merge gate")
     pl.add_argument("--branch")
     pl.set_defaults(func=cmd_problem_list)
 
@@ -434,9 +621,28 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--json", action="store_true")
     c.set_defaults(func=cmd_status)
 
-    c = sub.add_parser("gate", help="Exit 0 if safe to merge, else 1")
+    c = sub.add_parser(
+        "gate",
+        help="Merge verdict. Exit 0 = OPEN (ship), 1 = REVIEW_AGAIN, 2 = NEEDS_DECISION (human)",
+    )
     c.add_argument("--branch")
     c.set_defaults(func=cmd_gate)
+
+    c = sub.add_parser("budget", help="Show or override the feature's review-round budget")
+    knob = c.add_mutually_exclusive_group()
+    knob.add_argument("--set", type=int, help="Pin the budget to N review rounds")
+    knob.add_argument("--auto", action="store_true", help="Drop the override; auto-size from the PR diff")
+    c.add_argument("--branch")
+    c.set_defaults(func=cmd_budget)
+
+    c = sub.add_parser("escalate", help="Hand a non-converging review loop to a human decision")
+    c.add_argument("--reason", required=True, help="What you found and what you recommend")
+    c.add_argument("--branch")
+    c.set_defaults(func=cmd_escalate)
+
+    c = sub.add_parser("migrate", help="Upgrade a feature issue's state block to the current schema")
+    c.add_argument("--branch")
+    c.set_defaults(func=cmd_migrate)
 
     c = sub.add_parser("merge", help="Mark feature merged and close its issue (checks gate)")
     c.add_argument("--branch")
