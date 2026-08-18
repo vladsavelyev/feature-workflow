@@ -30,11 +30,15 @@ def test_disposition_removes_a_high_severity_problem_from_the_blocking_set():
     assert severity(deferred) == "sev:high"
 
 
-def test_missing_severity_label_is_reported_not_guessed():
-    assert severity({"number": 1, "title": "t", "state": "OPEN", "labels": ["problem"]}) == "sev:?"
+def test_a_problem_with_no_severity_label_blocks():
+    """Fail safe: only an explicit sev:low is non-blocking, so a missing label can't loosen the gate."""
+    unlabelled = {"number": 1, "title": "t", "state": "OPEN", "labels": ["problem"]}
+    assert severity(unlabelled) == "sev:?"
+    assert is_blocking(unlabelled)
+    assert [s["number"] for s in triage([unlabelled]).blocking] == [1]
 
 
-def test_triage_splits_blocking_debt_and_closed():
+def test_triage_splits_blocking_from_debt_and_drops_closed():
     subs = [
         sub(1, sev="sev:high"),
         sub(2, sev="sev:low"),
@@ -44,7 +48,6 @@ def test_triage_splits_blocking_debt_and_closed():
     t = triage(subs)
     assert [s["number"] for s in t.blocking] == [1]
     assert [s["number"] for s in t.debt] == [2, 3]
-    assert [s["number"] for s in t.closed] == [4]
 
 
 def test_triage_summary_names_the_debt_that_ships():

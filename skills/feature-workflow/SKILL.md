@@ -34,10 +34,10 @@ config, so any session on the branch can reconstruct it.
 | See / change how many review rounds this feature gets | `feature budget` (`--set <n>` to override, `--auto` to go back to diff-sized) |
 | Hand a non-converging loop to a human | `feature escalate --reason "<what you found + what you recommend>"` |
 | Sync branch with base (recursive) | `feature sync` (or `--stack` for the whole stack) — delegates to git-town; reopens the gate if the base moved |
-| Check if safe to merge | `feature gate` — **exit 0 = OPEN (ship), 1 = REVIEW_AGAIN, 2 = NEEDS_DECISION (stop, ask the human)** |
+| Check if safe to merge | `feature gate` — **exit 0 = OPEN (ship), 10 = REVIEW_AGAIN, 20 = NEEDS_DECISION (stop, ask the human)**; 1/2 still mean the command itself failed |
 | After merging, close out | `feature merge` |
 | Resume / understand a branch | `feature status` |
-| A feature issue written by an older CLI | `feature migrate` (one-way state-block upgrade) |
+| A repo/feature issue predating this CLI version | `feature migrate` — (re-)creates the workflow labels AND upgrades the state block. Run it once per repo after the CLI is upgraded; `problem defer`/`reject` abort without the newer labels. |
 
 ## Starting a session on an existing branch
 
@@ -102,7 +102,7 @@ when asked to review:
    - **duplicate?** Judge by *meaning*, not wording (the same bug is titled differently every
      review). Matches an OPEN problem → skip it. Matches a CLOSED problem → **regression**:
      reopen it (`gh issue reopen <#>`) and count it in both `--new-blocking` (if it is
-     high/med) and `--regressions`. No match → genuinely new.
+     high/med) and, if it is high/med, in `--regressions`. No match → genuinely new.
    - **caused by THIS PR?** If the finding is a pre-existing issue in a file the PR merely
      touches, or an adjacent improvement the PR didn't create, it is **never blocking** — file
      it `--sev low`, or file it and `feature problem defer <#> --reason "pre-existing, not
@@ -112,14 +112,16 @@ when asked to review:
      - `high` — data loss, security hole, crash, or a silently wrong result on a realistic path.
      - `med` — a real bug on a narrower path, or a correctness/robustness defect that will bite.
      - `low` — style, naming, duplication, altitude, hypotheticals, anything you couldn't tie to
-       a concrete failure. **Low never blocks the merge.**
+       a concrete failure. **Low never blocks the merge**, and it is the ONLY non-blocking
+       severity: a problem with no `sev:` label blocks until labelled (fail-safe), so always pass
+       `--sev`.
 5. **File the genuinely-new ones** — `feature problem add --title "…" --sev high|med|low`, putting
    the concrete failure scenario + `file:line` in the body. The body is usually multi-line and
    has code snippets, so pipe it via `--body-file -` (`… --body-file - <<'EOF' … EOF`) rather
    than `--body "…"`, which mangles backticks/quotes/newlines through the shell.
 6. **Record the run so the gate moves** — `feature review record --sha $(git rev-parse HEAD)
    --new-blocking <high+med filed, plus blocking regressions> --new-low <lows filed>
-   --regressions <closed problems reopened> --summary "<one line>"`. Skipping this leaves the gate
+   --regressions <closed BLOCKING problems reopened> --summary "<one line>"`. Skipping this leaves the gate
    at "no valid review run recorded" even after you've filed problems. The command prints the
    resulting gate verdict and your next step — **read it and obey it** (see below).
    - The `--summary` must be a **real sentence derived from the review**, not boilerplate — draw
@@ -147,8 +149,10 @@ don't decide on vibes, and don't launch another finder subagent without one tell
 | `feature gate` | Exit | What you do |
 | --- | --- | --- |
 | `OPEN` | 0 | Report that it's safe to merge, name the debt that ships, stop. The human merges. |
-| `REVIEW_AGAIN` | 1 | Fix the blocking problems, then run **one** more review round. |
-| `NEEDS_DECISION` | 2 | **STOP. Do not run another review.** `feature escalate --reason "…"` and hand the human a recommendation. |
+| `REVIEW_AGAIN` | 10 | Fix the blocking problems, then run **one** more review round. |
+| `NEEDS_DECISION` | 20 | **STOP. Do not run another review.** `feature escalate --reason "…"` and hand the human a recommendation. |
+
+(Exit 1 or 2 means the *command* failed — bad flag, missing wiring, `gh` error. Read the message; don't treat it as a verdict.)
 
 `NEEDS_DECISION` fires when the review budget (2–4 rounds, auto-sized from diff size and whether
 the PR touches paths the repo marked sensitive) is spent, or earlier when the loop is visibly not

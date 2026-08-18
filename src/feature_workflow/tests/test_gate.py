@@ -1,6 +1,6 @@
 """Tests for the merge-gate decision logic — the tri-state verdict and the churn signals."""
 
-from feature_workflow.gate import Verdict, churn_reason, evaluate, rounds_since_invalidation
+from feature_workflow.gate import EXIT_CODES, Verdict, churn_reason, evaluate, rounds_since_invalidation
 
 
 def run(n: int, *, blocking: int = 0, low: int = 0, regressions: int = 0) -> dict:
@@ -36,7 +36,6 @@ def test_low_severity_findings_do_not_hold_the_gate():
 def test_review_again_while_budget_remains():
     d = evaluate(blocking_open=2, last_review=DIRTY, history=[DIRTY], budget=3)
     assert d.verdict is Verdict.REVIEW_AGAIN
-    assert d.exit_code == 1
     assert "2 blocking problem(s) open" in d.reasons
     assert d.rounds_used == 1
 
@@ -45,7 +44,6 @@ def test_needs_decision_when_budget_spent():
     history = [run(1, blocking=3), run(2, blocking=1)]
     d = evaluate(blocking_open=1, last_review=history[-1], history=history, budget=2)
     assert d.verdict is Verdict.NEEDS_DECISION
-    assert d.exit_code == 2
     assert any("budget spent (2/2)" in r for r in d.reasons)
 
 
@@ -62,6 +60,26 @@ def test_regression_is_immediate_churn():
     d = evaluate(blocking_open=1, last_review=history[-1], history=history, budget=4)
     assert d.verdict is Verdict.NEEDS_DECISION
     assert any("re-opened 1 previously-closed" in r for r in d.reasons)
+
+
+def test_exit_codes_never_collide_with_command_failure_codes():
+    """1 and 2 already mean "the command failed" (sys.exit(msg), argparse); verdicts must not."""
+    codes = {v: EXIT_CODES[v] for v in Verdict}
+    assert codes[Verdict.OPEN] == 0
+    assert set(codes.values()).isdisjoint({1, 2})
+    assert len(set(codes.values())) == len(codes)
+
+
+def test_a_placeholder_round_spends_budget_but_not_the_trend():
+    """Migrated features carry counted-but-detail-free rounds; the trend must ignore them."""
+    placeholder = {"run": 1, "placeholder": True, "summary": "(pre-upgrade)"}
+    history = [placeholder, run(2, blocking=3)]
+    assert churn_reason(history) is None
+    d = evaluate(blocking_open=3, last_review=history[-1], history=history, budget=2)
+    # Two rounds are spent (the placeholder counts), so the budget check — not churn — escalates.
+    assert d.rounds_used == 2
+    assert d.verdict is Verdict.NEEDS_DECISION
+    assert any("budget spent (2/2)" in r for r in d.reasons)
 
 
 def test_converging_run_still_reviews_again():

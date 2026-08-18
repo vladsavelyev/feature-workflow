@@ -7,6 +7,8 @@ idempotently regardless of what humans write around it. We never blind-string-re
 import json
 import re
 
+from . import gate
+
 BEGIN = "<!--FEATURE-STATE:BEGIN-->"
 END = "<!--FEATURE-STATE:END-->"
 SCHEMA = 2
@@ -108,6 +110,39 @@ def review_entry(*, run: int, sha: str, new_blocking: int, new_low: int, regress
     }
 
 
+def record_review(
+    state: dict, *, sha: str, new_blocking: int, new_low: int, regressions: int, summary: str
+) -> tuple[dict, bool]:
+    """Record a review run into `state`. Returns (entry, replaced_an_existing_run).
+
+    Idempotent per reviewed sha, which matters because recording is followed by network calls that
+    can fail transiently: the natural response is to re-run the identical command, and appending
+    blindly would spend a second round and make one review look like two identical ones — tripping
+    the "findings are not decreasing" churn rule into escalating to a human. Two rounds at the same
+    sha can't be a real re-review either: nothing changed between them.
+    """
+    current = gate.rounds_since_invalidation(state["review_history"])
+    replacing = next((e for e in current if e.get("sha") == sha), None)
+    entry = review_entry(
+        run=replacing["run"] if replacing else state["review_runs"] + 1,
+        sha=sha,
+        new_blocking=new_blocking,
+        new_low=new_low,
+        regressions=regressions,
+        summary=summary,
+    )
+    if replacing:
+        state["review_history"][state["review_history"].index(replacing)] = entry
+    else:
+        state["review_runs"] = entry["run"]
+        state["review_history"].append(entry)
+    state["last_review"] = entry
+    # Work resumed, so a feature parked for a human decision is back in review.
+    if state["status"] == "needs-decision":
+        set_status(state, "in-review")
+    return entry, replacing is not None
+
+
 def migrate(state: dict) -> dict:
     """Upgrade a state dict to the current schema. One-way, and only 1 → 2 exists.
 
@@ -120,6 +155,8 @@ def migrate(state: dict) -> dict:
     if version != 1:
         raise ValueError(f"Cannot migrate feature state from schema {version} to {SCHEMA}")
 
+    if "last_review" not in state:
+        raise ValueError("Schema-1 state block is missing `last_review`; it cannot be migrated safely")
     old = state.pop("last_review")
     state["schema"] = SCHEMA
     state["review_budget"] = None
@@ -129,15 +166,28 @@ def migrate(state: dict) -> dict:
     if old is None:
         state["review_history"] = []
         state["last_review"] = None
-    else:
-        entry = review_entry(
-            run=old["run"],
-            sha=old["sha"],
-            new_blocking=old["new_problems"],
-            new_low=0,
-            regressions=0,
-            summary=old["summary"],
-        )
-        state["review_history"] = [entry]
-        state["last_review"] = entry
+        return state
+
+    entry = review_entry(
+        run=old["run"],
+        sha=old["sha"],
+        new_blocking=old["new_problems"],
+        new_low=0,
+        regressions=0,
+        summary=old["summary"],
+    )
+    # Rounds already spent must survive the upgrade. The gate counts rounds by walking
+    # `review_history`, so a history rebuilt from `last_review` alone would silently refund every
+    # earlier round — handing an already-exhausted feature a fresh budget, the opposite of this
+    # function's whole point. Schema 1 kept no per-round detail, so the earlier rounds come back as
+    # counted placeholders: they spend budget but are excluded from the convergence trend.
+    state["review_history"] = [
+        {
+            "run": run,
+            "placeholder": True,
+            "summary": "(reviewed before the schema-2 upgrade; per-round detail was not recorded)",
+        }
+        for run in range(1, state["review_runs"])
+    ] + [entry]
+    state["last_review"] = entry
     return state

@@ -34,7 +34,7 @@ from .state import (
     parse_block_raw,
     render_block,
     replace_block,
-    review_entry,
+    record_review,
     set_status,
 )
 
@@ -178,7 +178,7 @@ def cmd_adopt(args: argparse.Namespace) -> None:
     if pr is not None:
         _, state, body = _load_state(name)
         state["pr"] = pr
-        state["status"] = "in-review"
+        set_status(state, "in-review")
         _save_state(issue, body, state)
         github.link_pr_to_feature(pr, issue)
         github.comment(issue, f"🔗 Linked PR #{pr}.")
@@ -195,7 +195,7 @@ def cmd_prompt(args: argparse.Namespace) -> None:
     issue, state, body = _load_state(branch)
     state["last_prompt"] = args.text
     if state["status"] == "planning":
-        state["status"] = "in-progress"
+        set_status(state, "in-progress")
     _save_state(issue, body, state)
     print(f"Recorded prompt for #{issue}")
 
@@ -204,7 +204,7 @@ def cmd_pr(args: argparse.Namespace) -> None:
     branch = args.branch or current_branch()
     issue, state, body = _load_state(branch)
     state["pr"] = args.number
-    state["status"] = "in-review"
+    set_status(state, "in-review")
     _save_state(issue, body, state)
     # Native link: `Part of #<issue>` in the PR body so GitHub shows the connection in the PR
     # sidebar and the issue timeline — not just a comment that no linked-issues view reads.
@@ -235,22 +235,19 @@ def cmd_review_record(args: argparse.Namespace) -> None:
             f"wrong diff (pulling in the base branch's own commits). Reopen the PR against "
             f"'{expected_base}' (`gh pr edit {state['pr']} --base {expected_base}`), then retry."
         )
-    run_num = state["review_runs"] + 1
-    entry = review_entry(
-        run=run_num,
+    entry, replaced = record_review(
+        state,
         sha=args.sha,
         new_blocking=args.new_blocking,
         new_low=args.new_low,
         regressions=args.regressions,
         summary=args.summary,
     )
-    state["review_runs"] = run_num
-    state["review_history"].append(entry)
-    state["last_review"] = entry
-    _save_state(issue, body, state)
+    run_num = entry["run"]
 
-    # Recording a run is exactly the moment the agent needs the verdict — whether to fix and
-    # review again, or to stop and escalate. Print it here so nobody has to know to ask.
+    # Compute the verdict from in-memory state BEFORE the write, so a failure here can't leave a
+    # recorded round with no verdict reported. Recording a run is exactly the moment the agent needs
+    # to know whether to fix and review again, or to stop and escalate.
     triaged = _triage(issue)
     rounds, _ = _resolve_budget(state)
     decision = gate.evaluate(
@@ -259,13 +256,17 @@ def cmd_review_record(args: argparse.Namespace) -> None:
         history=state["review_history"],
         budget=rounds,
     )
+    _save_state(issue, body, state)
     github.comment(
         issue,
         f"🔍 Review run {run_num} ({args.sha}): {args.new_blocking} new blocking, {args.new_low} new low, "
         f"{args.regressions} regression(s). {len(triaged.blocking)} blocking open. {args.summary}\n\n"
         f"Gate: {decision}",
     )
-    print(f"Recorded review run {run_num} for #{issue}")
+    if replaced:
+        print(f"Replaced the existing run {run_num} for sha {args.sha} in #{issue} (no round spent)")
+    else:
+        print(f"Recorded review run {run_num} for #{issue}")
     print(f"GATE {decision}")
     print(f"  → {decision.next_step}")
 
@@ -435,6 +436,8 @@ def cmd_budget(args: argparse.Namespace) -> None:
     branch = args.branch or current_branch()
     issue, state, body = _load_state(branch)
     if args.set is not None:
+        if args.set < 1:
+            sys.exit(f"A review budget of {args.set} would pin the gate at NEEDS_DECISION; pass 1 or more.")
         state["review_budget"] = args.set
         _save_state(issue, body, state)
         github.comment(issue, f"🎚 Review budget set to {args.set} round(s).")
@@ -475,17 +478,25 @@ def cmd_escalate(args: argparse.Namespace) -> None:
 
 
 def cmd_migrate(args: argparse.Namespace) -> None:
-    """Upgrade a feature issue's state block to the current schema (one-way)."""
+    """Upgrade a repo + feature issue to what the current CLI expects (one-way).
+
+    This is the single upgrade entry point, which is why it also (re-)creates the workflow labels:
+    `deferred` and `rejected` are newer than the original label set, and `gh issue edit --add-label`
+    hard-fails on a label the repo doesn't have — so on every repo onboarded before dispositions
+    existed, `feature problem defer` (the main escape hatch out of a closed gate) would abort with
+    an opaque error. Labels first, then the state block.
+    """
     branch = args.branch or current_branch()
     issue = _resolve_issue(branch)
+    github.init_labels()
     body = github.get_issue_body(issue)
     state = parse_block_raw(body)
     if state.get("schema") == SCHEMA:
-        print(f"#{issue} is already at schema {SCHEMA}; nothing to do.")
+        print(f"Workflow labels are up to date; #{issue} is already at schema {SCHEMA}.")
         return
     was = state.get("schema")
     _save_state(issue, body, migrate(state))
-    print(f"Migrated #{issue} state from schema {was} to {SCHEMA}.")
+    print(f"Workflow labels are up to date; migrated #{issue} state from schema {was} to {SCHEMA}.")
 
 
 def cmd_merge(args: argparse.Namespace) -> None:
@@ -502,12 +513,24 @@ def cmd_merge(args: argparse.Namespace) -> None:
     set_status(state, "merged")
     body = github.get_issue_body(issue)
     _save_state(issue, body, state)
-    # Name the debt that ships. Deferred and low-severity problems stay open on purpose, and a
-    # merge note that claimed "all problems resolved" would bury exactly what someone will need
-    # to find later.
-    github.close_issue(issue, f"✅ Merged. No blocking problems; {triaged.summary()}.")
+    # Name what actually shipped, derived from the triage rather than asserted. Deferred and
+    # low-severity problems stay open on purpose, and on the --force path there may be blocking
+    # problems too — a note claiming "no blocking problems" there would put a false statement in the
+    # feature's permanent record, which is the exact failure this workflow exists to prevent.
+    if decision.open:
+        note = f"✅ Merged. No blocking problems; {triaged.summary()}."
+    else:
+        overridden = ", ".join(f"#{s['number']} [{problems.severity(s)}]" for s in triaged.blocking) or "none"
+        note = (
+            f"⚠️ Merged with `--force` while the gate was **{decision.verdict}** "
+            f"({'; '.join(decision.reasons)}).\n\n"
+            f"Blocking problems overridden: {overridden}.\n{triaged.summary()}."
+        )
+    github.close_issue(issue, note)
     print(f"Marked feature #{issue} merged and closed it.")
     print(f"  {triaged.summary()}")
+    if not decision.open:
+        print(f"  overridden with --force: {len(triaged.blocking)} blocking problem(s) still open")
 
 
 def cmd_sync(args: argparse.Namespace) -> None:
@@ -600,7 +623,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--regressions",
         type=int,
         default=0,
-        help="Count of previously-closed problems re-opened this run (any severity) — a churn signal",
+        help="Count of previously-closed BLOCKING (high/med) problems re-opened this run — a churn signal",
     )
     r.add_argument("--summary", required=True)
     r.add_argument("--branch")
@@ -634,8 +657,9 @@ def build_parser() -> argparse.ArgumentParser:
     pj.add_argument("--branch")
     pj.set_defaults(func=cmd_problem_reject)
     pl = psub.add_parser("list", help="List problem sub-issues")
-    pl.add_argument("--open", action="store_true", help="Only open problems")
-    pl.add_argument("--blocking", action="store_true", help="Only problems that hold the merge gate")
+    which = pl.add_mutually_exclusive_group()
+    which.add_argument("--open", action="store_true", help="Only open problems")
+    which.add_argument("--blocking", action="store_true", help="Only problems that hold the merge gate")
     pl.add_argument("--branch")
     pl.set_defaults(func=cmd_problem_list)
 
@@ -646,7 +670,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     c = sub.add_parser(
         "gate",
-        help="Merge verdict. Exit 0 = OPEN (ship), 1 = REVIEW_AGAIN, 2 = NEEDS_DECISION (human)",
+        help="Merge verdict. Exit 0 = OPEN (ship), 10 = REVIEW_AGAIN, 20 = NEEDS_DECISION (human)",
     )
     c.add_argument("--branch")
     c.set_defaults(func=cmd_gate)
@@ -663,7 +687,7 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--branch")
     c.set_defaults(func=cmd_escalate)
 
-    c = sub.add_parser("migrate", help="Upgrade a feature issue's state block to the current schema")
+    c = sub.add_parser("migrate", help="Upgrade a repo's labels + a feature issue's state block for this CLI")
     c.add_argument("--branch")
     c.set_defaults(func=cmd_migrate)
 

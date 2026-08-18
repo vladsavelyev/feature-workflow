@@ -13,13 +13,14 @@ reviewer always finds *something*:
 | `feature gate` | Exit | Meaning |
 | --- | --- | --- |
 | `OPEN` | 0 | No blocking problems, last review clean. Ship it. |
-| `REVIEW_AGAIN` | 1 | Blocking work left, review budget remains. |
-| `NEEDS_DECISION` | 2 | Budget spent, or the loop is churning. A human decides: ship the debt, split, or redesign. |
+| `REVIEW_AGAIN` | 10 | Blocking work left, review budget remains. |
+| `NEEDS_DECISION` | 20 | Budget spent, or the loop is churning. A human decides: ship the debt, split, or redesign. |
 
-Only `sev:high`/`sev:med` problems block; `sev:low` is tracked debt that ships. Anything you decide
-to ship unfixed gets an explicit, reasoned disposition (`feature problem defer`) instead of a
-silent severity downgrade, and reviews are budgeted (2–4 rounds, sized from the diff) so a
-non-converging loop ends in a recorded decision rather than unbounded spend.
+Only an explicit `sev:low` is non-blocking: it's tracked debt that ships. A problem with no
+severity label blocks until someone labels it, so a missing label can't quietly loosen the gate.
+Anything you decide to ship unfixed gets an explicit, reasoned disposition (`feature problem
+defer`) instead of a silent severity downgrade, and reviews are budgeted (2–4 rounds, sized from
+the diff) so a non-converging loop ends in a recorded decision rather than unbounded spend.
 
 See [docs/design.md](docs/design.md) for the full design, and
 [docs/motivation.md](docs/motivation.md) for the design history — why it's shaped this way and
@@ -69,7 +70,7 @@ feature problem reject 48 --reason "verifier is validated upstream in middleware
 # re-review, then record a clean pass (0 new blocking) to open the gate:
 feature review record --sha $(git rev-parse HEAD) --new-blocking 0 --new-low 1 \
     --summary "Re-reviewed oauth.py; #46 fixed; one naming nit filed"
-feature gate                                   # exit 0 = safe to merge, 2 = ask a human
+feature gate                                   # exit 0 = safe to merge, 20 = ask a human
 ```
 
 Adopt a branch you already have:
@@ -87,7 +88,7 @@ feature adopt --init-labels
 | `feature prompt <text>` | Record the latest prompt. |
 | `feature pr <number>` | Link a PR to the feature. |
 | `feature review record --sha <s> --new-blocking <n> [--new-low <n>] [--regressions <n>] --summary <t>` | Record an in-session review run (moves the gate) and print the resulting verdict. |
-| `feature problem add --title <t> --sev <high\|med\|low>` | Add a problem sub-issue (`high`/`med` block the gate). |
+| `feature problem add --title <t> --sev <high\|med\|low>` | Add a problem sub-issue (anything but `low` blocks the gate). |
 | `feature problem resolve <number> [--commit <sha>]` | Close a problem sub-issue as fixed. |
 | `feature problem defer <number> --reason <why>` | Real problem, shipped unfixed: stays open, stops blocking, reason recorded. |
 | `feature problem reject <number> --reason <why>` | False positive / by design: closed with the reasoning. |
@@ -96,9 +97,9 @@ feature adopt --init-labels
 | `feature escalate --reason <t>` | Park at `needs-decision` with your recommendation for a human. |
 | `feature status [--branch <b>] [--json]` | Reconstruct and print feature state. |
 | `feature sync [--branch <b>] [--stack]` | Sync the branch with its base via git-town; if the base advanced, invalidates the last review so the gate reopens. |
-| `feature gate [--branch <b>]` | Exit 0 = OPEN, 1 = REVIEW_AGAIN, 2 = NEEDS_DECISION. |
+| `feature gate [--branch <b>]` | Exit 0 = OPEN, 10 = REVIEW_AGAIN, 20 = NEEDS_DECISION (1 and 2 stay "the command failed"). |
 | `feature merge [--branch <b>] [--force]` | Mark merged and close the issue (checks gate; names the debt that ships). |
-| `feature migrate [--branch <b>]` | Upgrade an older feature issue's state block to the current schema. |
+| `feature migrate [--branch <b>]` | Upgrade a repo for this CLI version: (re-)create the workflow labels and the feature issue's state block. Run it once per repo after upgrading. |
 
 ## SessionStart hook
 

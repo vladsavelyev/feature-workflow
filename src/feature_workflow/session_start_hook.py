@@ -42,8 +42,20 @@ def main() -> None:
         return  # not a tracked feature; nothing to inject
 
     buf = io.StringIO()
-    with redirect_stdout(buf):
-        cmd_status(_Args())
+    try:
+        with redirect_stdout(buf):
+            cmd_status(_Args())
+    except ValueError as exc:
+        # A state block this CLI doesn't understand is the one failure with a known, one-command
+        # fix, and it fires on EVERY session start until someone applies it. Surfacing the message
+        # (which names `feature migrate`) beats a traceback in the session-context hook. Narrow on
+        # purpose: only ValueError, only from parsing, and the original text is included — this is
+        # not a blanket catch, and no other failure is softened.
+        print("<feature-context>")
+        print(f"This branch is a TRACKED FEATURE, but its state could not be read: {exc}")
+        print("Run `feature migrate` on this branch before using any other `feature` command.")
+        print("</feature-context>")
+        return
 
     print("<feature-context>")
     print(buf.getvalue().rstrip())
