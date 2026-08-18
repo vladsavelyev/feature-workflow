@@ -117,11 +117,17 @@ feature create ─┐
 | Verdict | Exit | When |
 | --- | --- | --- |
 | `OPEN` | 0 | Zero **blocking** problems open, and the last valid review reported `new_blocking == 0`. |
-| `REVIEW_AGAIN` | 1 | Blocking work outstanding, review budget remains, and the trend is converging. |
-| `NEEDS_DECISION` | 2 | The budget is spent, **or** the loop is visibly not converging. A human decides. |
+| `REVIEW_AGAIN` | 10 | Blocking work outstanding, review budget remains, and the trend is converging. |
+| `NEEDS_DECISION` | 20 | The budget is spent, **or** the loop is visibly not converging. A human decides. |
 
-**Only blocking problems hold the gate.** A problem blocks if it is open, `sev:high`/`sev:med`, and
-carries no disposition label. `sev:low` is tracked debt that ships. The two dispositions —
+The codes skip 1 and 2 deliberately: those already mean "the command failed" (`sys.exit(message)`
+and argparse both use them), so reusing them would make a lost git-config key or a `gh` 503 read as
+"spend another review round", and a mistyped flag read as "escalate to a human".
+
+**Only blocking problems hold the gate.** A problem blocks if it is open, carries no disposition
+label, and is not explicitly `sev:low`. Stated that way round on purpose: severity is the value the
+gate depends on, so an unlabelled problem — a human filing a sub-issue through the GitHub UI without
+picking a label — fails *safe* and holds the merge. `sev:low` is tracked debt that ships. The two dispositions —
 `deferred` (real, deliberately not fixed here) and `rejected` (not a real problem) — each require a
 reason that is posted on the sub-issue, so shipping known debt is an explicit, auditable act rather
 than a silent severity downgrade. Deferred problems stay **open** on purpose and are named in the
@@ -195,7 +201,7 @@ All commands are `feature <cmd>` (or the `feature` console script).
 | `feature problem list [--open] [--blocking]` | List problem sub-issues with severity and disposition. `--blocking` shows only what holds the gate. |
 | `feature budget [--set <n> \| --auto] [--branch <b>]` | Show the review-round budget and how much of it is used; `--set` pins it, `--auto` returns to diff-sizing. |
 | `feature escalate --reason <text> [--branch <b>]` | Park the feature at `needs-decision` and post the gate state + your recommendation for a human. |
-| `feature migrate [--branch <b>]` | One-way upgrade of a feature issue's state block to the current schema. |
+| `feature migrate [--branch <b>]` | The upgrade path for a repo onboarded on an older CLI: (re-)creates the workflow labels (`deferred`/`rejected` are newer than the original set, and `gh issue edit --add-label` hard-fails on a label the repo lacks) and upgrades the state block one-way. |
 | `feature gate [--branch <b>]` | Print the verdict and the next step. Exit 0 = `OPEN`, 1 = `REVIEW_AGAIN`, 2 = `NEEDS_DECISION`. |
 | `feature merge [--branch <b>] [--force]` | Final transition: verify the gate, set status `merged`, close the feature issue. Does not merge the PR itself. |
 | `feature sync [--branch <b>] [--stack]` | Sync the branch with its base via `git town sync` (recursive over ancestors; `--stack` for the whole stack). If the base advanced, invalidates the last review so the gate reopens and a fresh review + `review record` is required. Delegates to git-town; does not auto-resolve conflicts. |
@@ -220,7 +226,8 @@ agent session ─▶ spawn finder SUBAGENT (PR# only — NO tracked state loaded
               └─ distinct                ─▶ `feature problem add --sev high|med|low`
                     │
    `feature review record --new-blocking <high+med filed & regressed> --new-low <n>
-                          --regressions <n>`     (refuses to run if no PR linked)
+                          --regressions <blocking reopened>`   (refuses if no PR linked;
+                          idempotent per sha, so a retry after a failed call spends no extra round)
                     │
                     ▼
    prints the verdict: OPEN (ship) / REVIEW_AGAIN (one more round) / NEEDS_DECISION (escalate)
@@ -281,9 +288,10 @@ positives never reach the gate.
 
 `feature review record --new-blocking <n>` takes the count of genuinely-new *blocking* problems plus
 blocking regressions; a clean pass is `--new-blocking 0`, which (with zero open blocking sub-issues)
-opens the gate. `--new-low` and `--regressions` don't gate anything directly — they're what the
-convergence trend is read from, and they keep the record honest about what a "clean" round actually
-found.
+opens the gate. `--new-low` doesn't gate anything — it keeps the record honest about what a "clean"
+round actually found. `--regressions` counts re-opened *blocking* problems only, and feeds the churn
+signal: a re-opened low-severity nit is not evidence the design is wrong, and escalating on one would
+contradict the rule that low severity never gates.
 
 **Severity is now load-bearing, so it's auditable.** An agent could open the gate by calling
 everything `sev:low`, so the defenses are made of records, not restrictions: every disposition

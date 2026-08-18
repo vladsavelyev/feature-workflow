@@ -42,7 +42,7 @@ def auto_rounds(*, changed_files: int, changed_lines: int, sensitive_hits: list[
         rounds += 1
         why.append(f"+1 touches sensitive path(s): {shown}")
 
-    if rounds > MAX_ROUNDS:
-        why.append(f"capped at {MAX_ROUNDS}")
-        rounds = MAX_ROUNDS
-    return rounds, why
+    # Ceiling, not a live branch: the bumps above happen to add up to exactly MAX_ROUNDS today. It
+    # stays as the one place a future bump can't quietly escape, and `feature budget --set` is the
+    # documented way past it.
+    return min(rounds, MAX_ROUNDS), why

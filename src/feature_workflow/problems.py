@@ -14,7 +14,12 @@ severity downgrade. Everything with a disposition is reported at merge time.
 
 from dataclasses import dataclass
 
-BLOCKING_SEVS = ("sev:high", "sev:med")
+# Only an EXPLICIT `sev:low` is non-blocking. Stated this way round on purpose: severity is the
+# value the gate now depends on, so an unlabelled problem — a human filing a sub-issue through the
+# GitHub UI without picking a label, or a label removed later — must fail *safe* and hold the merge.
+# Enumerating the blocking severities instead would silently let `sev:?` through.
+NON_BLOCKING_SEVS = ("sev:low",)
+UNKNOWN_SEV = "sev:?"
 
 DEFERRED = "deferred"
 REJECTED = "rejected"
@@ -22,8 +27,8 @@ DISPOSITIONS = (DEFERRED, REJECTED)
 
 
 def severity(sub: dict) -> str:
-    """The `sev:*` label on a problem, or `sev:?` if it somehow has none."""
-    return next((label for label in sub["labels"] if label.startswith("sev:")), "sev:?")
+    """The `sev:*` label on a problem, or `sev:?` if it has none (which blocks — see above)."""
+    return next((label for label in sub["labels"] if label.startswith("sev:")), UNKNOWN_SEV)
 
 
 def disposition(sub: dict) -> str | None:
@@ -33,16 +38,15 @@ def disposition(sub: dict) -> str | None:
 
 def is_blocking(sub: dict) -> bool:
     """True if this sub-issue holds the merge gate."""
-    return sub["state"] == "OPEN" and severity(sub) in BLOCKING_SEVS and disposition(sub) is None
+    return sub["state"] == "OPEN" and severity(sub) not in NON_BLOCKING_SEVS and disposition(sub) is None
 
 
 @dataclass(frozen=True)
 class Triage:
-    """A feature's sub-issues split the way every caller needs them."""
+    """A feature's open sub-issues split the way every caller needs them."""
 
-    blocking: list[dict]  # open, high/med, no disposition — these hold the gate
+    blocking: list[dict]  # open, not explicitly low, no disposition — these hold the gate
     debt: list[dict]  # open, non-blocking (low severity, or disposed) — ships with the PR
-    closed: list[dict]  # fixed or rejected
 
     def summary(self) -> str:
         """One line naming the debt that ships, so it is never invisible at merge time."""
@@ -53,11 +57,8 @@ class Triage:
 
 
 def triage(subs: list[dict]) -> Triage:
-    blocking = [s for s in subs if is_blocking(s)]
     open_subs = [s for s in subs if s["state"] == "OPEN"]
-    blocking_numbers = {s["number"] for s in blocking}
     return Triage(
-        blocking=blocking,
-        debt=[s for s in open_subs if s["number"] not in blocking_numbers],
-        closed=[s for s in subs if s["state"] != "OPEN"],
+        blocking=[s for s in open_subs if is_blocking(s)],
+        debt=[s for s in open_subs if not is_blocking(s)],
     )

@@ -34,8 +34,11 @@ class Verdict(StrEnum):
     NEEDS_DECISION = "NEEDS_DECISION"
 
 
-# Exit codes are the machine interface: 0 ship, 1 keep going, 2 human needed.
-EXIT_CODES = {Verdict.OPEN: 0, Verdict.REVIEW_AGAIN: 1, Verdict.NEEDS_DECISION: 2}
+# Exit codes are the machine interface. Deliberately NOT 1 and 2: those are already spoken for by
+# "the command failed" — an uncaught exception and `sys.exit("message")` exit 1, argparse usage
+# errors exit 2. If REVIEW_AGAIN were 1, a lost `feature-issue` git-config key or a `gh` 503 would
+# read as "spend another review round", and a mistyped flag would read as "escalate to a human".
+EXIT_CODES = {Verdict.OPEN: 0, Verdict.REVIEW_AGAIN: 10, Verdict.NEEDS_DECISION: 20}
 
 
 @dataclass(frozen=True)
@@ -81,23 +84,30 @@ def churn_reason(rounds: list[dict]) -> str | None:
     """Why spending another review round looks futile, or None if the loop is converging.
 
     Two signals, both cheap and explainable:
-      * the last round re-opened previously-closed problems — the fixes are reintroducing known
-        bugs, which is a design smell, not a review-more smell;
+      * the last round re-opened previously-closed *blocking* problems — the fixes are
+        reintroducing known bugs, which is a design smell, not a review-more smell;
       * blocking findings stopped decreasing round over round — the loop is treading water.
+
+    Both key off blocking counts only. A re-opened low-severity nit is not evidence that the design
+    is wrong, and escalating on it would contradict the rule that low severity never gates.
     """
-    if not rounds:
+    if not rounds or rounds[-1].get("placeholder"):
         return None
     last = rounds[-1]
     if last["regressions"]:
         return (
-            f"run {last['run']} re-opened {last['regressions']} previously-closed problem(s) — "
-            f"the fixes are reintroducing known bugs"
+            f"run {last['run']} re-opened {last['regressions']} previously-closed blocking "
+            f"problem(s) — the fixes are reintroducing known bugs"
         )
-    if len(rounds) >= 2 and last["new_blocking"] and last["new_blocking"] >= rounds[-2]["new_blocking"]:
-        return (
-            f"blocking findings are not decreasing ({rounds[-2]['new_blocking']} then "
-            f"{last['new_blocking']}) — another round is unlikely to converge"
-        )
+    # Placeholder rounds carry no counts (see `state.migrate`), so a trend through one is
+    # meaningless — the budget check below is what catches those features.
+    if len(rounds) >= 2 and not any(r.get("placeholder") for r in rounds[-2:]):
+        previous, current = rounds[-2]["new_blocking"], last["new_blocking"]
+        if current and current >= previous:
+            return (
+                f"blocking findings are not decreasing ({previous} then {current}) — "
+                f"another round is unlikely to converge"
+            )
     return None
 
 
