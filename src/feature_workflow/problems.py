@@ -56,7 +56,7 @@ def is_blocking(sub: dict) -> bool:
 class Triage:
     """A feature's open sub-issues split the way every caller needs them."""
 
-    blocking: list[dict]  # open, not explicitly low, no disposition — these hold the gate
+    blocking: list[dict]  # open, not explicitly low, not deferred — these hold the gate
     debt: list[dict]  # open, non-blocking (low severity, or disposed) — ships with the PR
 
     def summary(self) -> str:

@@ -12,7 +12,7 @@ reviewer always finds *something*:
 
 | `feature gate` | Exit | Meaning |
 | --- | --- | --- |
-| `OPEN` | 0 | No blocking problems, last review clean. Ship it. |
+| `OPEN` | 0 | No blocking problems, and a review has covered the current branch head. Ship it. |
 | `REVIEW_AGAIN` | 10 | Blocking work left, review budget remains. |
 | `NEEDS_DECISION` | 20 | Budget spent, or the loop is churning. A human decides: ship the debt, split, or redesign. |
 
