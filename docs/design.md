@@ -133,6 +133,12 @@ reason that is posted on the sub-issue, so shipping known debt is an explicit, a
 than a silent severity downgrade. Deferred problems stay **open** on purpose and are named in the
 merge comment: debt you can't see isn't tracked.
 
+Only `deferred` suppresses blocking. `rejected` expresses itself by *closing* the issue, so an OPEN
+issue still carrying the label means someone overturned the rejection — a later round rediscovering
+it with a real repro — and it blocks like anything else. `feature problem block` is the explicit way
+to revoke a deferral; without an inverse, a disposition would be permanent, and a rediscovered
+problem could never get back in front of the gate.
+
 **Why not "zero findings".** The original gate demanded a review run that found *nothing*. The
 reviewer is built to report at every altitude — real defects, nits, pre-existing issues in files the
 PR merely touches — so a zero-finding run is an event that essentially never happens, and the loop
@@ -198,11 +204,12 @@ All commands are `feature <cmd>` (or the `feature` console script).
 | `feature problem resolve <number> [--commit <sha>]` | Close a problem sub-issue with a fixing-commit reference. |
 | `feature problem defer <number> --reason <why>` | Real problem, deliberately not fixed in this PR: labels it `deferred`, posts the reason, keeps it **open** but out of the blocking set. |
 | `feature problem reject <number> --reason <why>` | Not a real problem (false positive / by design): labels it `rejected` and closes it with the reasoning. |
+| `feature problem block <number> --reason <why>` | Revoke a disposition — drops `deferred`, re-opens if closed — so the problem holds the merge again. The inverse of `defer`, needed because a later round can rediscover a deferred problem with a repro that changes the call. |
 | `feature problem list [--open] [--blocking]` | List problem sub-issues with severity and disposition. `--blocking` shows only what holds the gate. |
 | `feature budget [--set <n> \| --auto] [--branch <b>]` | Show the review-round budget and how much of it is used; `--set` pins it, `--auto` returns to diff-sizing. |
 | `feature escalate --reason <text> [--branch <b>]` | Park the feature at `needs-decision` and post the gate state + your recommendation for a human. |
 | `feature migrate [--branch <b>]` | The upgrade path for a repo onboarded on an older CLI: (re-)creates the workflow labels (`deferred`/`rejected` are newer than the original set, and `gh issue edit --add-label` hard-fails on a label the repo lacks) and upgrades the state block one-way. |
-| `feature gate [--branch <b>]` | Print the verdict and the next step. Exit 0 = `OPEN`, 1 = `REVIEW_AGAIN`, 2 = `NEEDS_DECISION`. |
+| `feature gate [--branch <b>]` | Print the verdict and the next step. Exit 0 = `OPEN`, 10 = `REVIEW_AGAIN`, 20 = `NEEDS_DECISION` (1 and 2 stay "the command itself failed"). |
 | `feature merge [--branch <b>] [--force]` | Final transition: verify the gate, set status `merged`, close the feature issue. Does not merge the PR itself. |
 | `feature sync [--branch <b>] [--stack]` | Sync the branch with its base via `git town sync` (recursive over ancestors; `--stack` for the whole stack). If the base advanced, invalidates the last review so the gate reopens and a fresh review + `review record` is required. Delegates to git-town; does not auto-resolve conflicts. |
 

@@ -21,6 +21,7 @@ from contextlib import redirect_stdout
 
 from .__main__ import cmd_status
 from .gitwiring import current_branch, feature_issue
+from .state import StaleSchema
 
 
 class _Args:
@@ -45,12 +46,13 @@ def main() -> None:
     try:
         with redirect_stdout(buf):
             cmd_status(_Args())
-    except ValueError as exc:
-        # A state block this CLI doesn't understand is the one failure with a known, one-command
-        # fix, and it fires on EVERY session start until someone applies it. Surfacing the message
-        # (which names `feature migrate`) beats a traceback in the session-context hook. Narrow on
-        # purpose: only ValueError, only from parsing, and the original text is included — this is
-        # not a blanket catch, and no other failure is softened.
+    except StaleSchema as exc:
+        # A state block this CLI doesn't understand is the one failure with a known, one-command fix,
+        # and it fires on EVERY session start until someone applies it. Surfacing the message (which
+        # names `feature migrate`) beats a traceback in the session-context hook. Caught by its own
+        # exception type, not by `ValueError`: `cmd_status` also makes several `gh` calls whose
+        # parsing raises plain ValueErrors, and reporting those as "run feature migrate" would be
+        # advice that cannot fix them. Nothing else is softened.
         print("<feature-context>")
         print(f"This branch is a TRACKED FEATURE, but its state could not be read: {exc}")
         print("Run `feature migrate` on this branch before using any other `feature` command.")

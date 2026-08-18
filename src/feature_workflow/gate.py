@@ -103,7 +103,9 @@ def churn_reason(rounds: list[dict]) -> str | None:
     # meaningless — the budget check below is what catches those features.
     if len(rounds) >= 2 and not any(r.get("placeholder") for r in rounds[-2:]):
         previous, current = rounds[-2]["new_blocking"], last["new_blocking"]
-        if current and current >= previous:
+        # Both must be nonzero: a clean round followed by a dirty one (0 -> n) is a fix introducing
+        # something new, which the budget already bounds — not the plateau this rule looks for.
+        if current and previous and current >= previous:
             return (
                 f"blocking findings are not decreasing ({previous} then {current}) — "
                 f"another round is unlikely to converge"

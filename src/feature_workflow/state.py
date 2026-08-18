@@ -7,13 +7,18 @@ idempotently regardless of what humans write around it. We never blind-string-re
 import json
 import re
 
-from . import gate
-
 BEGIN = "<!--FEATURE-STATE:BEGIN-->"
 END = "<!--FEATURE-STATE:END-->"
 SCHEMA = 2
 
 VALID_STATUS = {"planning", "in-progress", "in-review", "needs-decision", "ready", "merged"}
+
+
+class StaleSchema(ValueError):
+    """The state block was written by a different CLI version. Distinct type so the SessionStart
+    hook can recognise THIS failure — the one with a known one-command fix — without also
+    swallowing every other ValueError (a bad `gh` payload, a corrupt JSON block) behind advice
+    that wouldn't fix it."""
 
 # Non-greedy match of everything between the markers, across newlines.
 _BLOCK_RE = re.compile(re.escape(BEGIN) + r"(.*?)" + re.escape(END), re.DOTALL)
@@ -50,7 +55,7 @@ def parse_block(issue_body: str) -> dict:
     state = parse_block_raw(issue_body)
     version = state.get("schema")
     if version != SCHEMA:
-        raise ValueError(
+        raise StaleSchema(
             f"Feature state is schema {version}, but this CLI speaks schema {SCHEMA}. "
             f"Run `feature migrate` to upgrade this feature issue's state block."
         )
@@ -110,37 +115,48 @@ def review_entry(*, run: int, sha: str, new_blocking: int, new_low: int, regress
     }
 
 
-def record_review(
-    state: dict, *, sha: str, new_blocking: int, new_low: int, regressions: int, summary: str
-) -> tuple[dict, bool]:
-    """Record a review run into `state`. Returns (entry, replaced_an_existing_run).
+def record_review(state: dict, *, sha: str, new_blocking: int, new_low: int, regressions: int, summary: str) -> dict:
+    """Record a review run into `state` as a new round. Always appends; never rewrites history.
 
-    Idempotent per reviewed sha, which matters because recording is followed by network calls that
-    can fail transiently: the natural response is to re-run the identical command, and appending
-    blindly would spend a second round and make one review look like two identical ones — tripping
-    the "findings are not decreasing" churn rule into escalating to a human. Two rounds at the same
-    sha can't be a real re-review either: nothing changed between them.
+    Retry-safety is the *caller's* job, achieved by ordering: the state write must be the last
+    fallible operation, so a failure anywhere leaves nothing recorded and a retry records exactly
+    once. An earlier attempt to get it here — replace any entry with the same sha, on the theory
+    that a repeated sha means "retry" — was worse than the problem it solved. Rounds at an unchanged
+    sha are legitimate (`problem defer` makes progress without committing), so it silently rewrote a
+    real round's counts and never spent budget, which made the review loop unbounded again.
     """
-    current = gate.rounds_since_invalidation(state["review_history"])
-    replacing = next((e for e in current if e.get("sha") == sha), None)
     entry = review_entry(
-        run=replacing["run"] if replacing else state["review_runs"] + 1,
+        run=state["review_runs"] + 1,
         sha=sha,
         new_blocking=new_blocking,
         new_low=new_low,
         regressions=regressions,
         summary=summary,
     )
-    if replacing:
-        state["review_history"][state["review_history"].index(replacing)] = entry
-    else:
-        state["review_runs"] = entry["run"]
-        state["review_history"].append(entry)
+    state["review_runs"] = entry["run"]
+    state["review_history"].append(entry)
     state["last_review"] = entry
     # Work resumed, so a feature parked for a human decision is back in review.
     if state["status"] == "needs-decision":
         set_status(state, "in-review")
-    return entry, replacing is not None
+    return entry
+
+
+# A round that happened before the schema-2 upgrade: it spends budget (schema 1 counted it) but
+# carries no counts, so `gate.churn_reason` skips any trend that runs through one.
+def _placeholder_rounds(count: int) -> list[dict]:
+    return [
+        {
+            "run": run,
+            "placeholder": True,
+            "summary": "(reviewed before the schema-2 upgrade; per-round detail was not recorded)",
+        }
+        for run in range(1, count + 1)
+    ]
+
+
+# Schema 1 signalled "a base change invalidated the reviews before this" by nulling `last_review`.
+_INVALIDATED = {"event": "base-advanced-before-upgrade"}
 
 
 def migrate(state: dict) -> dict:
@@ -163,8 +179,13 @@ def migrate(state: dict) -> dict:
     # Schema 1 had a single `new_problems` count with no severity split. Treat every one of them
     # as blocking: that keeps a gate that was closed still closed, where the reverse guess could
     # open it on unreviewed evidence.
+    # No valid last review, but rounds on the clock: schema-1 `sync` nulled `last_review` and left
+    # `review_runs` alone. Reproduce those semantics exactly — the rounds happened (so they stay in
+    # the log) but a base change invalidated them, which is what the marker means, and the feature
+    # gets a fresh budget. Dropping the history instead would refund the rounds AND desync
+    # `review_runs` from it.
     if old is None:
-        state["review_history"] = []
+        state["review_history"] = [*_placeholder_rounds(state["review_runs"]), _INVALIDATED]
         state["last_review"] = None
         return state
 
@@ -181,13 +202,11 @@ def migrate(state: dict) -> dict:
     # earlier round — handing an already-exhausted feature a fresh budget, the opposite of this
     # function's whole point. Schema 1 kept no per-round detail, so the earlier rounds come back as
     # counted placeholders: they spend budget but are excluded from the convergence trend.
-    state["review_history"] = [
-        {
-            "run": run,
-            "placeholder": True,
-            "summary": "(reviewed before the schema-2 upgrade; per-round detail was not recorded)",
-        }
-        for run in range(1, state["review_runs"])
-    ] + [entry]
+    #
+    # This over-counts in one unknowable case: a schema-1 feature synced *between* rounds spent
+    # rounds that the sync then invalidated, and schema 1 recorded nothing about when that happened.
+    # Over-counting is the safe side — it asks a human (recoverable with `feature budget --set`),
+    # where under-counting would silently hand out free review rounds.
+    state["review_history"] = [*_placeholder_rounds(state["review_runs"] - 1), entry]
     state["last_review"] = entry
     return state
