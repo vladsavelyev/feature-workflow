@@ -235,7 +235,7 @@ def cmd_review_record(args: argparse.Namespace) -> None:
             f"wrong diff (pulling in the base branch's own commits). Reopen the PR against "
             f"'{expected_base}' (`gh pr edit {state['pr']} --base {expected_base}`), then retry."
         )
-    entry, replaced = record_review(
+    entry = record_review(
         state,
         sha=args.sha,
         new_blocking=args.new_blocking,
@@ -245,9 +245,11 @@ def cmd_review_record(args: argparse.Namespace) -> None:
     )
     run_num = entry["run"]
 
-    # Compute the verdict from in-memory state BEFORE the write, so a failure here can't leave a
-    # recorded round with no verdict reported. Recording a run is exactly the moment the agent needs
-    # to know whether to fix and review again, or to stop and escalate.
+    # ORDER IS THE RETRY STRATEGY: every fallible call happens BEFORE the single state write, so a
+    # failure anywhere leaves the round unrecorded and re-running the command records it exactly
+    # once. (A duplicated timeline comment, the one thing a retry can repeat, is harmless noise; a
+    # half-recorded round is not.) Reporting the verdict here is the point of the command — it's when
+    # the agent learns whether to fix and review again or to stop and escalate.
     triaged = _triage(issue)
     rounds, _ = _resolve_budget(state)
     decision = gate.evaluate(
@@ -256,17 +258,14 @@ def cmd_review_record(args: argparse.Namespace) -> None:
         history=state["review_history"],
         budget=rounds,
     )
-    _save_state(issue, body, state)
     github.comment(
         issue,
         f"🔍 Review run {run_num} ({args.sha}): {args.new_blocking} new blocking, {args.new_low} new low, "
         f"{args.regressions} regression(s). {len(triaged.blocking)} blocking open. {args.summary}\n\n"
         f"Gate: {decision}",
     )
-    if replaced:
-        print(f"Replaced the existing run {run_num} for sha {args.sha} in #{issue} (no round spent)")
-    else:
-        print(f"Recorded review run {run_num} for #{issue}")
+    _save_state(issue, body, state)
+    print(f"Recorded review run {run_num} for #{issue}")
     print(f"GATE {decision}")
     print(f"  → {decision.next_step}")
 
@@ -319,6 +318,23 @@ def cmd_problem_reject(args: argparse.Namespace) -> None:
     github.add_label(args.number, problems.REJECTED)
     github.close_issue(args.number, f"🚫 Rejected — not a real problem: {args.reason}")
     print(f"Rejected problem #{args.number}")
+
+
+def cmd_problem_block(args: argparse.Namespace) -> None:
+    """Revoke a deferral: this problem holds the merge after all.
+
+    The inverse of `defer`, and it needs to exist. A later review round can rediscover a deferred
+    problem with a repro that changes the call, and without this the deferral was permanent — the
+    problem would sit outside the gate with no way to put it back.
+    """
+    branch = args.branch or current_branch()
+    sub = _require_problem(branch, args.number)
+    if problems.DEFERRED in sub["labels"]:
+        github.remove_label(args.number, problems.DEFERRED)
+    if sub["state"] != "OPEN":
+        github.reopen_issue(args.number, f"↩️ Re-opened: {args.reason}")
+    github.comment(args.number, f"⛔ Blocking again — the earlier disposition is revoked: {args.reason}")
+    print(f"Problem #{args.number} [{problems.severity(sub)}] blocks the gate again")
 
 
 def _problem_line(sub: dict) -> str:
@@ -427,7 +443,8 @@ def cmd_gate(args: argparse.Namespace) -> None:
     print(f"GATE {decision} (#{issue})")
     print(f"  → {decision.next_step}")
     print(f"  {triaged.summary()}")
-    # Exit code is the machine interface: 0 ship, 1 review again, 2 human decision needed.
+    # Exit code is the machine interface: 0 ship, 10 review again, 20 human decision needed.
+    # (1 and 2 mean the command itself failed — see gate.EXIT_CODES.)
     sys.exit(decision.exit_code)
 
 
@@ -656,6 +673,11 @@ def build_parser() -> argparse.ArgumentParser:
     pj.add_argument("--reason", required=True, help="Why this is not a real problem")
     pj.add_argument("--branch")
     pj.set_defaults(func=cmd_problem_reject)
+    pb = psub.add_parser("block", help="Revoke a disposition: this problem holds the merge after all")
+    pb.add_argument("number", type=int)
+    pb.add_argument("--reason", required=True, help="What changed — why it must block now")
+    pb.add_argument("--branch")
+    pb.set_defaults(func=cmd_problem_block)
     pl = psub.add_parser("list", help="List problem sub-issues")
     which = pl.add_mutually_exclusive_group()
     which.add_argument("--open", action="store_true", help="Only open problems")

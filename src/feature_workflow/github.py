@@ -157,6 +157,11 @@ def add_label(number: int, label: str) -> None:
     run(["gh", "issue", "edit", str(number), "--add-label", label])
 
 
+def remove_label(number: int, label: str) -> None:
+    """Remove a label from an issue (used to revoke a disposition, so it blocks again)."""
+    run(["gh", "issue", "edit", str(number), "--remove-label", label])
+
+
 def get_issue_body(number: int) -> str:
     return run(["gh", "issue", "view", str(number), "--json", "body", "--jq", ".body"])
 

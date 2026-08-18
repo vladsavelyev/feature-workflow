@@ -115,10 +115,14 @@ def test_migrate_preserves_rounds_already_spent():
     assert migrated["review_history"][0]["run"] == 1
 
 
-def test_migrate_with_no_prior_review():
-    migrated = migrate(dict(SCHEMA_1_STATE) | {"last_review": None})
+def test_migrate_of_a_synced_feature_keeps_the_rounds_but_invalidates_them():
+    """Schema-1 sync nulled last_review and left review_runs; reproduce that, don't drop history."""
+    migrated = migrate(dict(SCHEMA_1_STATE) | {"last_review": None})  # review_runs: 2
     assert migrated["last_review"] is None
-    assert migrated["review_history"] == []
+    # The rounds stay on the record...
+    assert [e["run"] for e in migrated["review_history"] if "run" in e] == [1, 2]
+    # ...but sit before an invalidation marker, so they don't spend the new budget.
+    assert rounds_since_invalidation(migrated["review_history"]) == []
 
 
 def test_migrate_is_idempotent_and_refuses_unknown_versions():
@@ -128,11 +132,11 @@ def test_migrate_is_idempotent_and_refuses_unknown_versions():
         migrate({"schema": 99})
 
 
-def _recorded(state: dict, sha: str, blocking: int) -> tuple[dict, bool]:
+def _recorded(state: dict, sha: str, blocking: int) -> dict:
     return record_review(state, sha=sha, new_blocking=blocking, new_low=0, regressions=0, summary=f"at {sha}")
 
 
-def test_record_review_spends_one_round_per_sha():
+def test_record_review_spends_one_round_per_call():
     state = new_state(branch="feat-x", base="main", updated="t0")
     _recorded(state, "aaa", 2)
     _recorded(state, "bbb", 1)
@@ -141,35 +145,21 @@ def test_record_review_spends_one_round_per_sha():
     assert state["last_review"]["sha"] == "bbb"
 
 
-def test_re_recording_the_same_sha_replaces_instead_of_spending_a_round():
-    """A retry after a transient gh failure must not look like a second, identical review round."""
+def test_a_second_round_at_an_unchanged_sha_is_a_real_round():
+    """`problem defer` makes progress without committing, so re-reviewing the same sha is genuine.
+
+    Collapsing these into one entry (an earlier attempt at retry-safety) rewrote a real round's
+    counts and never spent budget, which made the review loop unbounded again. Retry-safety is the
+    caller's ordering job instead: `cmd_review_record` writes state last.
+    """
     state = new_state(branch="feat-x", base="main", updated="t0")
     _recorded(state, "aaa", 2)
-    entry, replaced = _recorded(state, "aaa", 2)
-    assert replaced
-    assert entry["run"] == 1
-    assert state["review_runs"] == 1
-    assert len(state["review_history"]) == 1
-    assert rounds_since_invalidation(state["review_history"]) == [entry]
-
-
-def test_re_recording_the_same_sha_updates_the_counts():
-    state = new_state(branch="feat-x", base="main", updated="t0")
-    _recorded(state, "aaa", 2)
-    _recorded(state, "aaa", 5)
-    assert state["last_review"]["new_blocking"] == 5
-    assert len(state["review_history"]) == 1
-
-
-def test_a_sha_reviewed_before_a_base_change_spends_a_fresh_round():
-    """After sync the code differs even at a repeated sha, so it is a genuine new round."""
-    state = new_state(branch="feat-x", base="main", updated="t0")
-    _recorded(state, "aaa", 1)
-    state["review_history"].append({"event": "base-advanced", "sha": "aaa"})
-    entry, replaced = _recorded(state, "aaa", 1)
-    assert not replaced
-    assert entry["run"] == 2
-    assert rounds_since_invalidation(state["review_history"]) == [entry]
+    second = _recorded(state, "aaa", 0)
+    assert second["run"] == 2
+    assert state["review_runs"] == 2
+    # The first round's real counts survive.
+    assert [e["new_blocking"] for e in state["review_history"]] == [2, 0]
+    assert len(rounds_since_invalidation(state["review_history"])) == 2
 
 
 def test_recording_a_run_takes_a_parked_feature_back_into_review():

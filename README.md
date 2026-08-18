@@ -47,7 +47,7 @@ uv sync && uv run feature --help
   ```
 
 Reviews run **in-session** (not as a spawned `claude` subprocess): the agent already in a Claude
-Code session runs `/code-review` on the feature's **PR** in a fresh subagent so each re-run finds
+Code session reviews the feature's **PR by number** in a fresh subagent so each re-run finds
 blind, then dedups the findings against tracked problems, files the new ones, and records the run
 via this CLI. A linked PR is required — the PR diff defines the review scope (correct even for
 stacked branches), and `feature review record` refuses to run without one. There is no headless
@@ -92,6 +92,7 @@ feature adopt --init-labels
 | `feature problem resolve <number> [--commit <sha>]` | Close a problem sub-issue as fixed. |
 | `feature problem defer <number> --reason <why>` | Real problem, shipped unfixed: stays open, stops blocking, reason recorded. |
 | `feature problem reject <number> --reason <why>` | False positive / by design: closed with the reasoning. |
+| `feature problem block <number> --reason <why>` | Revoke a disposition so the problem blocks again (inverse of `defer`). |
 | `feature problem list [--open] [--blocking]` | List problem sub-issues with severity and disposition. |
 | `feature budget [--set <n> \| --auto]` | Show or override the review-round budget. |
 | `feature escalate --reason <t>` | Park at `needs-decision` with your recommendation for a human. |

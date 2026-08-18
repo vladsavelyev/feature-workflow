@@ -31,6 +31,7 @@ config, so any session on the branch can reconstruct it.
 | Mark a problem fixed | `feature problem resolve <issue#> --commit <sha>` |
 | Ship a real problem unfixed (on the record) | `feature problem defer <issue#> --reason "<why it's acceptable>"` |
 | Kill a false positive (on the record) | `feature problem reject <issue#> --reason "<why it isn't real>"` |
+| Put a deferred/rejected problem back in the way | `feature problem block <issue#> --reason "<what changed>"` — revokes the disposition (and re-opens if it was closed) |
 | See / change how many review rounds this feature gets | `feature budget` (`--set <n>` to override, `--auto` to go back to diff-sized) |
 | Hand a non-converging loop to a human | `feature escalate --reason "<what you found + what you recommend>"` |
 | Sync branch with base (recursive) | `feature sync` (or `--stack` for the whole stack) — delegates to git-town; reopens the gate if the base moved |
@@ -170,6 +171,10 @@ Three rules that keep this honest:
 
 - **Never lower a severity to open the gate.** If a high/med problem should ship unfixed, `defer`
   it with a reason — same outcome, but the decision is attributable instead of hidden in a label.
+- **A disposition is revocable.** If a later round rediscovers a deferred problem with a repro that
+  changes the call, `feature problem block <#> --reason "…"` puts it back in the way. A `rejected`
+  problem you re-open (the regression rule in step 4) blocks again on its own — rejection is
+  expressed by the issue being closed, so re-opening one overturns it.
 - **Never `feature merge --force`** to get around a closed gate. Escalate; the human decides.
 - **Deferred and low problems stay OPEN on purpose** and are listed in the merge comment. Debt you
   can't see isn't tracked.

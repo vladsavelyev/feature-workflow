@@ -22,6 +22,19 @@ def test_closed_problems_never_block():
     assert not is_blocking(sub(1, state="CLOSED"))
 
 
+def test_a_reopened_rejected_problem_blocks_again():
+    """Rejection is expressed by closing, so an OPEN `rejected` issue means it was overturned.
+
+    A later round can rediscover a rejected problem with a real repro and reopen it (the skill's
+    regression rule). If the label still suppressed blocking, that live high-severity bug would sit
+    outside the gate forever — `github` has no way to remove a label except `problem block`.
+    """
+    reopened = sub(1, sev="sev:high", state="OPEN", extra=["rejected"])
+    assert is_blocking(reopened)
+    assert disposition(reopened) == "rejected"  # kept for the record
+    assert not is_blocking(sub(2, sev="sev:high", state="CLOSED", extra=["rejected"]))
+
+
 def test_disposition_removes_a_high_severity_problem_from_the_blocking_set():
     deferred = sub(1, sev="sev:high", extra=["deferred"])
     assert not is_blocking(deferred)

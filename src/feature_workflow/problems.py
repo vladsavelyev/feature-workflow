@@ -6,10 +6,17 @@ Two ideas do the work:
 (nits, naming, duplication, hypotheticals), so a gate that waits for "no findings at all" never
 opens. `sev:high` and `sev:med` block the merge; `sev:low` is tracked debt that ships.
 
-**A disposition takes a problem out of the blocking set, on the record.** `deferred` (real, but
-not being fixed in this PR) and `rejected` (not a real problem) both require a reason that is
-posted on the issue, so shipping known debt is an explicit, auditable act — not a silent
-severity downgrade. Everything with a disposition is reported at merge time.
+**A disposition takes a problem out of the blocking set, on the record.** `deferred` (real, but not
+being fixed in this PR) and `rejected` (not a real problem) both require a reason that is posted on
+the issue, so shipping known debt is an explicit, auditable act — not a silent severity downgrade.
+Deferred problems stay open and are named at merge time; rejected ones are closed, because a
+non-problem is not debt.
+
+Only `deferred` suppresses blocking. A `rejected` problem expresses itself by being *closed*, so if
+one is OPEN again someone overturned the rejection — a later review round rediscovering it with a
+real repro, per the skill's regression rule — and it must hold the merge like any other open
+problem. Suppressing on the label instead would let a reopened high-severity bug sit outside the
+gate with no way to put it back (`feature problem block` is the explicit way to revoke a deferral).
 """
 
 from dataclasses import dataclass
@@ -37,8 +44,12 @@ def disposition(sub: dict) -> str | None:
 
 
 def is_blocking(sub: dict) -> bool:
-    """True if this sub-issue holds the merge gate."""
-    return sub["state"] == "OPEN" and severity(sub) not in NON_BLOCKING_SEVS and disposition(sub) is None
+    """True if this sub-issue holds the merge gate. See the module docstring for the two rules."""
+    return (
+        sub["state"] == "OPEN"
+        and severity(sub) not in NON_BLOCKING_SEVS
+        and DEFERRED not in sub["labels"]
+    )
 
 
 @dataclass(frozen=True)

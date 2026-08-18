@@ -82,6 +82,14 @@ def test_a_placeholder_round_spends_budget_but_not_the_trend():
     assert any("budget spent (2/2)" in r for r in d.reasons)
 
 
+def test_a_clean_round_followed_by_a_dirty_one_is_not_a_plateau():
+    """0 -> n is a fix introducing something new, which the budget bounds; not "not decreasing"."""
+    history = [run(1, blocking=0), run(2, blocking=1)]
+    assert churn_reason(history) is None
+    d = evaluate(blocking_open=1, last_review=history[-1], history=history, budget=4)
+    assert d.verdict is Verdict.REVIEW_AGAIN
+
+
 def test_converging_run_still_reviews_again():
     history = [run(1, blocking=5), run(2, blocking=2)]
     d = evaluate(blocking_open=2, last_review=history[-1], history=history, budget=4)
