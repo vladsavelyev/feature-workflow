@@ -36,6 +36,16 @@ def run_head_sha(cwd: str | None = None) -> str:
     return run(["git", "rev-parse", "--short", "HEAD"], cwd=cwd)
 
 
+def branch_head_sha(branch: str, cwd: str | None = None) -> str:
+    """Short sha at the tip of `branch`, whatever the current working directory has checked out.
+
+    The gate asks whether the last review covered the code that is on the branch NOW, so it must
+    read the branch ref — not `HEAD`. `feature gate --branch other-feature` is legitimately run from
+    the main checkout, where `HEAD` is a different branch entirely.
+    """
+    return run(["git", "rev-parse", "--short", branch], cwd=cwd)
+
+
 def worktree_for_branch(branch: str, cwd: str | None = None) -> str | None:
     """Absolute path of the worktree that has `branch` checked out, or None if none does.
 

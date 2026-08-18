@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 
 from . import budget, gate, github, problems
 from .gitwiring import (
+    branch_head_sha,
     create_branch_and_worktree,
     current_branch,
     feature_issue,
@@ -67,7 +68,7 @@ def _save_state(issue: int, body: str, state: dict) -> None:
     github.set_issue_body(issue, replace_block(body, state))
 
 
-def _resolve_budget(state: dict) -> tuple[int, list[str]]:
+def _resolve_budget(state: dict) -> tuple[int, bool, list[str]]:
     """The feature's review-round budget: an explicit override, else auto-sized from the PR diff.
 
     Auto-sizing happens at query time rather than being frozen into the state block, so a branch
@@ -75,12 +76,13 @@ def _resolve_budget(state: dict) -> tuple[int, list[str]]:
     """
     explicit = state["review_budget"]
     if explicit is not None:
-        return explicit, [f"explicit override: {explicit} round(s)"]
+        return explicit, True, [f"explicit override: {explicit} round(s)"]
     if state["pr"] is None:
-        return budget.BASE_ROUNDS, ["no PR linked yet, so no diff to size — base budget for now"]
+        return budget.BASE_ROUNDS, False, ["no PR linked yet, so no diff to size — base budget for now"]
     files, lines = github.pr_diff_stats(state["pr"])
     hits = budget.sensitive_matches(github.pr_changed_paths(state["pr"]), sensitive_patterns())
-    return budget.auto_rounds(changed_files=files, changed_lines=lines, sensitive_hits=hits)
+    rounds, why = budget.auto_rounds(changed_files=files, changed_lines=lines, sensitive_hits=hits)
+    return rounds, False, why
 
 
 def _triage(issue: int) -> problems.Triage:
@@ -251,12 +253,14 @@ def cmd_review_record(args: argparse.Namespace) -> None:
     # half-recorded round is not.) Reporting the verdict here is the point of the command — it's when
     # the agent learns whether to fix and review again or to stop and escalate.
     triaged = _triage(issue)
-    rounds, _ = _resolve_budget(state)
+    rounds, pinned, _ = _resolve_budget(state)
     decision = gate.evaluate(
         blocking_open=len(triaged.blocking),
         last_review=state["last_review"],
         history=state["review_history"],
         budget=rounds,
+        head_sha=branch_head_sha(branch),
+        budget_is_explicit=pinned,
     )
     github.comment(
         issue,
@@ -264,7 +268,9 @@ def cmd_review_record(args: argparse.Namespace) -> None:
         f"{args.regressions} regression(s). {len(triaged.blocking)} blocking open. {args.summary}\n\n"
         f"Gate: {decision}",
     )
-    _save_state(issue, body, state)
+    # Re-read the body: it was fetched before several seconds of network calls, and writing the stale
+    # copy back would silently revert any human edit to the prose around the state block.
+    _save_state(issue, github.get_issue_body(issue), state)
     print(f"Recorded review run {run_num} for #{issue}")
     print(f"GATE {decision}")
     print(f"  → {decision.next_step}")
@@ -307,8 +313,12 @@ def cmd_problem_defer(args: argparse.Namespace) -> None:
     plus a reason on its timeline, which is what makes shipping it a decision rather than a leak.
     """
     sub = _require_problem(args.branch or current_branch(), args.number)
-    github.add_label(args.number, problems.DEFERRED)
+    # Reason FIRST, label second. The label is what stops the problem blocking, so if the comment
+    # fails (a `gh` 5xx) after labelling, the problem is out of the gate's way with no reason
+    # recorded anywhere — the silent, unattributable downgrade dispositions exist to prevent. This
+    # order fails the other way: reason posted, still blocking.
     github.comment(args.number, f"⏸ Deferred — not fixed in this PR, no longer blocking: {args.reason}")
+    github.add_label(args.number, problems.DEFERRED)
     print(f"Deferred problem #{args.number} [{problems.severity(sub)}] (still open, no longer blocking)")
 
 
@@ -329,6 +339,15 @@ def cmd_problem_block(args: argparse.Namespace) -> None:
     """
     branch = args.branch or current_branch()
     sub = _require_problem(branch, args.number)
+    # Severity outranks disposition in `is_blocking`, so clearing the label on a `sev:low` problem
+    # would change nothing while this command printed that it had. Refuse and name the real fix
+    # rather than report a success the gate doesn't agree with.
+    if problems.severity(sub) in problems.NON_BLOCKING_SEVS:
+        sys.exit(
+            f"#{args.number} is {problems.severity(sub)}, and low severity never blocks — clearing its "
+            f"disposition would change nothing. If it really blocks, re-file it at its true severity "
+            f"(`feature problem add --sev high|med …`) and close this one as a duplicate."
+        )
     if problems.DEFERRED in sub["labels"]:
         github.remove_label(args.number, problems.DEFERRED)
     if sub["state"] != "OPEN":
@@ -367,12 +386,14 @@ def cmd_status(args: argparse.Namespace) -> None:
         return
     _, state, _ = _load_state(branch)
     triaged = _triage(issue)
-    rounds, rounds_why = _resolve_budget(state)
+    rounds, pinned, rounds_why = _resolve_budget(state)
     decision = gate.evaluate(
         blocking_open=len(triaged.blocking),
         last_review=state["last_review"],
         history=state["review_history"],
         budget=rounds,
+        head_sha=branch_head_sha(branch),
+        budget_is_explicit=pinned,
     )
 
     if args.json:
@@ -427,12 +448,14 @@ def cmd_status(args: argparse.Namespace) -> None:
 def _gate_for(branch: str) -> tuple[int, dict, problems.Triage, gate.GateDecision]:
     issue, state, _ = _load_state(branch)
     triaged = _triage(issue)
-    rounds, _ = _resolve_budget(state)
+    rounds, pinned, _ = _resolve_budget(state)
     decision = gate.evaluate(
         blocking_open=len(triaged.blocking),
         last_review=state["last_review"],
         history=state["review_history"],
         budget=rounds,
+        head_sha=branch_head_sha(branch),
+        budget_is_explicit=pinned,
     )
     return issue, state, triaged, decision
 
@@ -452,9 +475,15 @@ def cmd_budget(args: argparse.Namespace) -> None:
     """Show — or override — how many review rounds this feature gets before a human decides."""
     branch = args.branch or current_branch()
     issue, state, body = _load_state(branch)
+    used = len(gate.rounds_since_invalidation(state["review_history"]))
     if args.set is not None:
-        if args.set < 1:
-            sys.exit(f"A review budget of {args.set} would pin the gate at NEEDS_DECISION; pass 1 or more.")
+        # Below the rounds already spent, the budget can only ever read "spent" — which pins the gate
+        # at NEEDS_DECISION by arithmetic. Refuse with the number that would actually help.
+        if args.set < max(1, used):
+            sys.exit(
+                f"A budget of {args.set} is at or below the {used} round(s) already spent, which pins "
+                f"the gate at NEEDS_DECISION. Pass {used + 1} or more to buy another round."
+            )
         state["review_budget"] = args.set
         _save_state(issue, body, state)
         github.comment(issue, f"🎚 Review budget set to {args.set} round(s).")
@@ -463,8 +492,7 @@ def cmd_budget(args: argparse.Namespace) -> None:
         _save_state(issue, body, state)
         github.comment(issue, "🎚 Review budget back to auto-sizing from the PR diff.")
 
-    rounds, why = _resolve_budget(state)
-    used = len(gate.rounds_since_invalidation(state["review_history"]))
+    rounds, _, why = _resolve_budget(state)
     print(f"Review budget: {rounds} round(s) — {'; '.join(why)}")
     print(f"Used         : {used} round(s) since the last base change")
 

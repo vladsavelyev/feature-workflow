@@ -2,8 +2,8 @@
 
 The gate has **three** outcomes, because a review loop has three real endings:
 
-  OPEN            — nothing blocking is left and the last review found no new blocking
-                    problems. Ship it.
+  OPEN            — nothing blocking is left, and a review has covered the code that is on the
+                    branch right now. Ship it.
   REVIEW_AGAIN    — blocking work is outstanding and there is review budget left to spend.
   NEEDS_DECISION  — the loop is not converging on its own: the budget is spent, or the trend
                     says another round won't help. A human decides: ship with recorded
@@ -103,21 +103,52 @@ def churn_reason(rounds: list[dict]) -> str | None:
     # meaningless — the budget check below is what catches those features.
     if len(rounds) >= 2 and not any(r.get("placeholder") for r in rounds[-2:]):
         previous, current = rounds[-2]["new_blocking"], last["new_blocking"]
-        # Both must be nonzero: a clean round followed by a dirty one (0 -> n) is a fix introducing
-        # something new, which the budget already bounds — not the plateau this rule looks for.
-        if current and previous and current >= previous:
+        # Strictly increasing, and both nonzero. One flat round (1 then 1) is the most common shape
+        # of a converging review, and firing on it made the auto-sized 3rd and 4th rounds nearly
+        # unreachable — the advertised 2-4 budget was effectively always 2. A rising count is the
+        # real "getting worse" signal; a plateau is left to the budget to bound.
+        if current and previous and current > previous:
             return (
-                f"blocking findings are not decreasing ({previous} then {current}) — "
+                f"blocking findings are rising ({previous} then {current}) — "
                 f"another round is unlikely to converge"
             )
     return None
 
 
-def evaluate(*, blocking_open: int, last_review: dict | None, history: list[dict], budget: int) -> GateDecision:
-    """Decide the gate from the blocking-problem count, the last review, and the trend.
+def covers_head(last_review: dict | None, head_sha: str) -> bool:
+    """Whether the last valid review looked at the code that is on the branch right now.
+
+    Short and long shas both occur (the CLI hands out `--short`, a caller may pass a full one), so
+    compare by prefix in either direction rather than demanding identical strings.
+    """
+    if last_review is None:
+        return False
+    reviewed = last_review["sha"]
+    return reviewed.startswith(head_sha) or head_sha.startswith(reviewed)
+
+
+def evaluate(
+    *,
+    blocking_open: int,
+    last_review: dict | None,
+    history: list[dict],
+    budget: int,
+    head_sha: str,
+    budget_is_explicit: bool = False,
+) -> GateDecision:
+    """Decide the gate from the open blocking problems and whether a review covers the current code.
 
     `blocking_open` counts only problems that hold the merge (see `problems.is_blocking`):
-    low-severity findings and anything given a recorded disposition are excluded by design.
+    low-severity findings and anything deferred with a recorded reason are excluded by design.
+
+    Note what the second condition is NOT. It used to be "the last review reported zero new blocking
+    problems", which reads a *count* — and a count goes stale the moment a problem is disposed of:
+    after a human said "ship the rest as debt" and the agent deferred everything, the gate still saw
+    the old nonzero count and stayed shut with no way to reopen it. Coverage asks the question the
+    safety property actually cares about — *has this code been reviewed?* — and answers both cases
+    correctly: a fix commits, so HEAD moves and a fresh review is required; a deferral doesn't, so
+    the existing review still stands and the human's decision takes effect. Counts remain in
+    `review_history` for the convergence trend.
     """
     rounds = rounds_since_invalidation(history)
     used = len(rounds)
@@ -127,13 +158,19 @@ def evaluate(*, blocking_open: int, last_review: dict | None, history: list[dict
         reasons.append(f"{blocking_open} blocking problem(s) open")
     if last_review is None:
         reasons.append("no valid review run recorded")
-    elif last_review["new_blocking"] != 0:
-        reasons.append(f"last review found {last_review['new_blocking']} new blocking problem(s)")
+    elif not covers_head(last_review, head_sha):
+        reasons.append(
+            f"the last review looked at {last_review['sha']}, but the branch is now at {head_sha} — "
+            f"that code has never been reviewed"
+        )
 
     if not reasons:
         return GateDecision(Verdict.OPEN, [], _NEXT_OPEN, used, budget)
 
-    churn = churn_reason(rounds)
+    # An explicitly raised budget outranks the churn heuristic. Churn exists to escalate *early*, so
+    # a human who has already seen that escalation and chosen to spend another round has answered it;
+    # re-deriving churn from the same unchanged history would make `budget --set` a silent no-op.
+    churn = None if (budget_is_explicit and used < budget) else churn_reason(rounds)
     if churn:
         return GateDecision(Verdict.NEEDS_DECISION, [*reasons, churn], _NEXT_DECISION, used, budget)
     if used >= budget:

@@ -116,7 +116,7 @@ feature create ─┐
 
 | Verdict | Exit | When |
 | --- | --- | --- |
-| `OPEN` | 0 | Zero **blocking** problems open, and the last valid review reported `new_blocking == 0`. |
+| `OPEN` | 0 | Zero **blocking** problems open, and the last valid review covered the current branch head. |
 | `REVIEW_AGAIN` | 10 | Blocking work outstanding, review budget remains, and the trend is converging. |
 | `NEEDS_DECISION` | 20 | The budget is spent, **or** the loop is visibly not converging. A human decides. |
 
@@ -124,8 +124,8 @@ The codes skip 1 and 2 deliberately: those already mean "the command failed" (`s
 and argparse both use them), so reusing them would make a lost git-config key or a `gh` 503 read as
 "spend another review round", and a mistyped flag read as "escalate to a human".
 
-**Only blocking problems hold the gate.** A problem blocks if it is open, carries no disposition
-label, and is not explicitly `sev:low`. Stated that way round on purpose: severity is the value the
+**Only blocking problems hold the gate.** A problem blocks if it is open, is not explicitly
+`sev:low`, and is not `deferred`. Stated that way round on purpose: severity is the value the
 gate depends on, so an unlabelled problem — a human filing a sub-issue through the GitHub UI without
 picking a label — fails *safe* and holds the merge. `sev:low` is tracked debt that ships. The two dispositions —
 `deferred` (real, deliberately not fixed here) and `rejected` (not a real problem) — each require a
@@ -143,8 +143,23 @@ problem could never get back in front of the gate.
 reviewer is built to report at every altitude — real defects, nits, pre-existing issues in files the
 PR merely touches — so a zero-finding run is an event that essentially never happens, and the loop
 had no other exit than `feature merge --force`, which recorded no rationale. The safety property the
-condition was actually protecting is narrower: *a fix must not introduce a new defect*. That needs
-`new_blocking == 0`, not `findings == 0`.
+condition was actually protecting is narrower: *a fix must not introduce a new defect*.
+
+**Why coverage rather than a count.** The obvious repair — require the last review to report
+`new_blocking == 0` — reads a *count*, and a count goes stale the moment a problem is disposed of.
+Deferring the remaining findings (the sanctioned "ship it as debt" path) leaves the old nonzero count
+in place, so the gate stayed shut with no way to reopen it: the escape hatch didn't work, and neither
+did buying another round, because the churn signal was re-derived from the same unchanged history and
+checked first. The condition is therefore **coverage**: `last_review.sha` must match the branch head.
+That asks what the safety property actually cares about — *has this code been reviewed?* — and gets
+both cases right. A fix commits, so the head moves and a fresh review is required; a deferral doesn't
+commit, so the existing review still stands and the human's decision takes effect. It also closes a
+hole the count rule never covered: commits landing *after* a clean review used to keep the gate open
+on code no review had seen. Counts stay in `review_history`, where the convergence trend reads them.
+
+An explicitly pinned budget (`feature budget --set`) also outranks the churn signal while rounds
+remain, because churn exists to escalate *early* — a human who has seen that escalation and chosen to
+spend another round has already answered it.
 
 **Why a budget.** A review round is the most expensive thing this workflow does (a full independent
 sweep by a subagent). `budget.py` sizes it from the diff: base 2 rounds, +1 for a large diff
@@ -158,9 +173,9 @@ stuck, so the gate escalates early on either of two signals: the last round re-o
 previously-closed problems (the fixes are reintroducing known bugs — a design problem, not a
 review-more problem), or blocking findings stopped decreasing round over round.
 
-`feature sync` upholds the clean-pass condition across base changes: when the base branch advances,
-the last clean review predates the newly merged code, so sync clears `last_review` and appends an
-invalidation marker to `review_history` — the gate reopens, the round count resets to the runs after
+`feature sync` upholds the coverage condition across base changes: the sync commit moves the head,
+which alone would already invalidate the review, and sync additionally clears `last_review` and
+appends an invalidation marker to `review_history` — the gate reopens, the round count resets to the runs after
 the marker (new code deserves a fresh budget), and a fresh review + `review record` is required.
 
 The gate is still a pure query: `feature gate` never mutates state. Parking a feature at

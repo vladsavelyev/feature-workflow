@@ -102,8 +102,11 @@ when asked to review:
      anything you can't concretely reproduce — a false positive must never close the gate.
    - **duplicate?** Judge by *meaning*, not wording (the same bug is titled differently every
      review). Matches an OPEN problem → skip it. Matches a CLOSED problem → **regression**:
-     reopen it (`gh issue reopen <#>`) and count it in both `--new-blocking` (if it is
-     high/med) and, if it is high/med, in `--regressions`. No match → genuinely new.
+     `feature problem block <#> --reason "rediscovered in review N: <repro>"` and count it in
+     `--new-blocking` and `--regressions` (if it is high/med). No match → genuinely new.
+     **Use `problem block`, not `gh issue reopen`** — a problem that was deferred keeps its
+     `deferred` label through `resolve`, so a raw re-open leaves it OPEN and *non-blocking*, and
+     the gate would go green with a live high-severity regression sitting outside it.
    - **caused by THIS PR?** If the finding is a pre-existing issue in a file the PR merely
      touches, or an adjacent improvement the PR didn't create, it is **never blocking** — file
      it `--sev low`, or file it and `feature problem defer <#> --reason "pre-existing, not
@@ -137,9 +140,10 @@ when asked to review:
      indistinguishable from a review that silently did nothing.
 
 Then the loop: fix each blocking problem → `feature problem resolve <#> --commit <sha>` → review
-in-session again → `feature review record …`. The gate stays closed until a review records **zero
-new blocking** problems (this forces a clean pass after your last fix). When `feature gate` exits
-0, the human merges.
+in-session again → `feature review record …`. The gate opens when nothing blocking is left AND the
+last recorded review covers the current branch head — so any commit after a review (including your
+fixes) requires one more round, while *deferring* the rest needs no round, because it changes no
+code. When `feature gate` exits 0, the human merges.
 
 ## When to stop reviewing (the part that used to loop forever)
 
