@@ -11,7 +11,13 @@ BEGIN = "<!--FEATURE-STATE:BEGIN-->"
 END = "<!--FEATURE-STATE:END-->"
 SCHEMA = 2
 
-VALID_STATUS = {"planning", "in-progress", "in-review", "needs-decision", "ready", "merged"}
+# `abandoned` is the other terminal status: the PR was closed without ever merging, so the work
+# never landed. It exists because the alternative for those features was staying `in-review`
+# forever — an open tracking issue for a PR nobody will merge is the same orphan as an unclosed
+# merged one, and calling it `merged` would put a false claim in the permanent record.
+VALID_STATUS = {"planning", "in-progress", "in-review", "needs-decision", "ready", "merged", "abandoned"}
+# The two ends of the line: a feature at either has no open PR left to reconcile against.
+TERMINAL_STATUS = frozenset({"merged", "abandoned"})
 
 
 class StaleSchema(ValueError):

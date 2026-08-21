@@ -29,6 +29,7 @@ from .gitwiring import (
 )
 from .state import (
     SCHEMA,
+    TERMINAL_STATUS,
     migrate,
     new_state,
     parse_block,
@@ -604,18 +605,18 @@ def cmd_merge(args: argparse.Namespace) -> None:
     # The issue may already be closed: the PR's `Closes #<issue>` reference fires the moment it
     # merges into the default branch, which is usually seconds before anyone runs this. Comment
     # either way, close only if it's still open.
-    _record_merged(issue, state, note, already_closed=github.get_issue(issue)["state"] != "OPEN")
+    _record_outcome(issue, state, note, status="merged", already_closed=github.get_issue(issue)["state"] != "OPEN")
     print(f"Marked feature #{issue} merged and closed it.")
     print(f"  {triaged.summary()}")
     if not decision.open:
         print(f"  overridden with --force: {len(triaged.blocking)} blocking problem(s) still open")
 
 
-def _record_merged(issue: int, state: dict, note: str, *, already_closed: bool) -> None:
-    """Post the outcome, close the issue, then write `status: merged` — in that order.
+def _record_outcome(issue: int, state: dict, note: str, *, status: str, already_closed: bool) -> None:
+    """Post the outcome, close the issue, then write the terminal `status` — in that order.
 
     ORDER IS THE RETRY STRATEGY, as in `review record`: the state write goes last, so a failure to
-    comment or close leaves the feature un-merged in the state block and a re-run does the whole
+    comment or close leaves the feature non-terminal in the state block and a re-run does the whole
     thing again (a duplicated timeline comment is harmless; a feature marked merged whose issue is
     still open would be skipped by every future `feature reconcile` — permanently orphaned).
     """
@@ -623,7 +624,7 @@ def _record_merged(issue: int, state: dict, note: str, *, already_closed: bool) 
         github.comment(issue, note)
     else:
         github.close_issue(issue, note)
-    set_status(state, "merged")
+    set_status(state, status)
     # Re-read the body: it was fetched before several network calls, and writing a stale copy back
     # would silently revert any human edit to the prose around the state block.
     _save_state(issue, github.get_issue_body(issue), state)
@@ -640,6 +641,30 @@ def _reconcile_note(pr: int, triaged: problems.Triage) -> str:
     return f"✅ Merged in PR #{pr} — recorded after the fact by `feature reconcile`. {triaged.summary()}."
 
 
+def _abandoned_note(pr: int, triaged: problems.Triage) -> str:
+    """The record for a feature whose PR was closed without merging: the work never landed."""
+    # Strictly what is known: the tracked PR closed unmerged. Whether the work later landed some
+    # other way is not something this sweep can see (it checked only for an *open* successor PR), so
+    # the note claims nothing about that and says how to correct the record if it did.
+    note = (
+        f"🗑 Abandoned — PR #{pr} was closed without ever merging, so this feature's work did not "
+        f"land through it, and the tracking issue would otherwise stay open forever. Closed by "
+        f"`feature reconcile`. If the work resumed or landed under a different PR, reopen this issue "
+        f"and re-link it with `feature pr <number>`."
+    )
+    if triaged.blocking or triaged.debt:
+        # Problems filed against code that never shipped are moot, but closing them here would
+        # decide that for the reviewer — some describe pre-existing defects the review merely found.
+        # Name them so somebody can triage rather than leaving them silently under a closed parent.
+        still_open = ", ".join(f"#{s['number']} [{problems.severity(s)}]" for s in triaged.blocking + triaged.debt)
+        note += (
+            f"\n\n{len(triaged.blocking) + len(triaged.debt)} problem(s) filed against it are still "
+            f"open: {still_open}. They describe code that never merged — close the ones that only "
+            f"existed in this branch, keep any that name a pre-existing defect."
+        )
+    return note
+
+
 def cmd_reconcile(args: argparse.Namespace) -> None:
     """Sweep the repo for features whose PR merged without anyone running `feature merge`.
 
@@ -650,6 +675,12 @@ def cmd_reconcile(args: argparse.Namespace) -> None:
     now carry a `Closes #<issue>` reference so GitHub closes the issue on merge, but that only fires
     for merges into the default branch (never for a stacked feature merged into its parent) and it
     writes no record — the state block stays at `in-review` and nothing names the debt that shipped.
+
+    A feature whose PR was closed *unmerged* is the same orphan seen from the other side — an open
+    tracking issue for work that will never land — so it closes too, as `abandoned` rather than
+    `merged`, since the record must not claim a merge that never happened. The one exception is a
+    branch that has since been re-proposed under a new PR: that feature is alive, and it gets handed
+    back with the number to link instead of being buried.
 
     Deliberately git-free: it reads GitHub only, so it works from any checkout long after the
     feature's branch and worktree are gone. It also repairs the link on still-open PRs, which is
@@ -677,11 +708,11 @@ def cmd_reconcile(args: argparse.Namespace) -> None:
         if state.get("schema") not in (1, SCHEMA):
             unreadable.append((row["number"], f"state block has unknown schema {state.get('schema')!r}"))
             continue
-        if state.get("pr") is not None and state.get("status") != "merged":
+        if state.get("pr") is not None and state.get("status") not in TERMINAL_STATUS:
             pending.append((row, state))
 
     states = github.pr_states([state["pr"] for _, state in pending])
-    closed_out, relinked, abandoned = 0, 0, 0
+    closed_out, abandoned, relinked, needs_human = 0, 0, 0, 0
     for row, state in pending:
         issue, pr = row["number"], state["pr"]
         pr_state = states[pr]
@@ -700,42 +731,67 @@ def cmd_reconcile(args: argparse.Namespace) -> None:
                 relinked += 1
             continue
         if pr_state == "CLOSED":
-            # Closed unmerged: the work never landed, so closing the feature issue would record a
-            # merge that didn't happen. A human decides — reopen the PR, or close the issue as
-            # abandoned with a reason.
-            print(
-                f"#{issue} ({row['title']}): PR #{pr} was CLOSED without merging, "
-                f"status '{state['status']}' — decide by hand"
-            )
-            abandoned += 1
-            continue
+            # Closed unmerged: the work never landed, so this ends as `abandoned`, never `merged`.
+            # First rule out the one case where the feature is alive anyway — the branch was
+            # re-proposed under a new PR the state block doesn't know about. Closing that feature
+            # would bury work in flight, so hand it back with the number to link instead.
+            successor = github.open_pr_for_branch(state["branch"])
+            if successor is not None:
+                print(
+                    f"#{issue} ({row['title']}): PR #{pr} was closed unmerged, but branch "
+                    f"'{state['branch']}' has open PR #{successor} — run `feature pr {successor}`"
+                )
+                needs_human += 1
+                continue
+
+        # From here the feature reaches a terminal status, so the state block gets written — which
+        # means an old schema has to be upgraded first, right here: `feature migrate` resolves its
+        # issue through the branch's git config and these branches are gone.
         triaged = _triage(issue)
+        merged = pr_state == "MERGED"
         upgrade = "" if state["schema"] == SCHEMA else f" + state upgraded from schema {state['schema']}"
         if args.dry_run:
-            print(
-                f"#{issue} ({row['title']}): PR #{pr} MERGED, status '{state['status']}' → "
-                f"would close out{upgrade}. {triaged.summary()}"
+            outcome = (
+                f"would close out{upgrade}. {triaged.summary()}" if merged else f"would close as abandoned{upgrade}"
             )
-            closed_out += 1
+            print(f"#{issue} ({row['title']}): PR #{pr} {pr_state}, status '{state['status']}' → {outcome}")
+            if merged:
+                closed_out += 1
+            else:
+                abandoned += 1
             continue
         if state["schema"] != SCHEMA:
-            # It merged, so the review budget and convergence trend the migration reconstructs no
-            # longer decide anything — but the block still has to be readable by every later command.
+            # The review budget and convergence trend the migration reconstructs no longer decide
+            # anything for a finished feature — but the block still has to be readable by every
+            # later command, and hand-editing 20 issue bodies is not a plan.
             try:
                 state = migrate(state)
             except ValueError as exc:
                 unreadable.append((issue, f"could not migrate its schema-{state['schema']} state block: {exc}"))
                 continue
-        _record_merged(issue, state, _reconcile_note(pr, triaged), already_closed=row["state"] != "OPEN")
-        blocking = f"; {len(triaged.blocking)} blocking problem(s) shipped open" if triaged.blocking else ""
-        print(f"#{issue} ({row['title']}): closed out — merged in PR #{pr}{upgrade}{blocking}")
-        closed_out += 1
+        _record_outcome(
+            issue,
+            state,
+            _reconcile_note(pr, triaged) if merged else _abandoned_note(pr, triaged),
+            status="merged" if merged else "abandoned",
+            already_closed=row["state"] != "OPEN",
+        )
+        if merged:
+            blocking = f"; {len(triaged.blocking)} blocking problem(s) shipped open" if triaged.blocking else ""
+            print(f"#{issue} ({row['title']}): closed out — merged in PR #{pr}{upgrade}{blocking}")
+            closed_out += 1
+        else:
+            left = len(triaged.blocking) + len(triaged.debt)
+            leftover = f"; {left} problem(s) left open to triage" if left else ""
+            print(f"#{issue} ({row['title']}): closed as abandoned — PR #{pr} never merged{upgrade}{leftover}")
+            abandoned += 1
 
     scope = f"feature for branch '{args.branch}'" if args.branch else f"{len(rows)} feature issue(s)"
+    did = "would close" if args.dry_run else "closed"
     tail = "" if args.dry_run else f", re-linked {relinked}"
     print(
-        f"Scanned {scope}: {'would close out' if args.dry_run else 'closed out'} {closed_out}"
-        f"{tail}, {abandoned} needing a human decision."
+        f"Scanned {scope}: {did} out {closed_out} merged, {did} {abandoned} abandoned"
+        f"{tail}, {needs_human} needing a human decision."
     )
     if unreadable:
         print(f"\n{len(unreadable)} feature issue(s) could not be reconciled:")

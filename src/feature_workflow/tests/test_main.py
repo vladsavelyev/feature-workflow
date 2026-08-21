@@ -35,26 +35,26 @@ def _stub_github(monkeypatch, *, calls: list[str], failing: str | None = None) -
     monkeypatch.setattr(github, "get_issue_body", lambda number: render_block(_merged_state()))
 
 
-def test_record_merged_closes_then_writes_state(monkeypatch):
+def test_record_outcome_closes_then_writes_state(monkeypatch):
     calls: list[str] = []
     _stub_github(monkeypatch, calls=calls)
     state = _merged_state()
-    cli._record_merged(42, state, "✅ Merged.", already_closed=False)
+    cli._record_outcome(42, state, "✅ Merged.", status="merged", already_closed=False)
     # The state write is LAST, and the close carries the note (one call, not close + comment).
     assert calls == ["close_issue", "set_issue_body"]
     assert state["status"] == "merged"
 
 
-def test_record_merged_only_comments_when_already_closed(monkeypatch):
+def test_record_outcome_only_comments_when_already_closed(monkeypatch):
     # The PR's `Closes #<issue>` reference usually closes the issue seconds before anyone runs the
     # close-out; `gh issue close` on a closed issue is not the way to find that out.
     calls: list[str] = []
     _stub_github(monkeypatch, calls=calls)
-    cli._record_merged(42, _merged_state(), "✅ Merged.", already_closed=True)
+    cli._record_outcome(42, _merged_state(), "✅ Merged.", status="merged", already_closed=True)
     assert calls == ["comment", "set_issue_body"]
 
 
-def test_record_merged_leaves_state_unwritten_if_closing_fails(monkeypatch):
+def test_record_outcome_leaves_state_unwritten_if_closing_fails(monkeypatch):
     # ORDER IS THE RETRY STRATEGY: a feature written as `merged` whose issue is still open would be
     # skipped by every future `feature reconcile` — orphaned permanently. Failing before the write
     # means a re-run does the whole thing again.
@@ -62,7 +62,7 @@ def test_record_merged_leaves_state_unwritten_if_closing_fails(monkeypatch):
     _stub_github(monkeypatch, calls=calls, failing="close_issue")
     state = _merged_state()
     with pytest.raises(CommandFailed):
-        cli._record_merged(42, state, "✅ Merged.", already_closed=False)
+        cli._record_outcome(42, state, "✅ Merged.", status="merged", already_closed=False)
     assert "set_issue_body" not in calls
     assert state["status"] == "in-review"
 
@@ -87,3 +87,19 @@ def test_reconcile_note_is_plain_when_nothing_was_blocking():
 def test_state_block_of_a_fresh_feature_is_current_schema():
     # Guards the assumption `reconcile` leans on when it reads a state block without a schema check.
     assert new_state(branch="b", base="main", updated="now")["schema"] == SCHEMA
+
+
+def test_abandoned_note_never_claims_a_merge():
+    triaged = problems.triage([_problem(9, "sev:med")])
+    note = cli._abandoned_note(123, triaged)
+    # The work never landed: saying "merged" here would put a false claim in the permanent record.
+    assert "Abandoned" in note
+    assert "Merged" not in note
+    # Its problems describe code that never shipped, but whether each is moot is the reviewer's
+    # call — they are named for triage, not closed silently.
+    assert "#9 [sev:med]" in note
+
+
+def test_abandoned_note_is_short_when_there_is_nothing_left_open():
+    note = cli._abandoned_note(123, problems.triage([_problem(9, "sev:med", state="CLOSED")]))
+    assert "still\nopen" not in note and "still open" not in note

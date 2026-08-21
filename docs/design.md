@@ -78,7 +78,8 @@ git config (per branch, local wiring):
 }
 ```
 
-`status` ∈ `planning | in-progress | in-review | needs-decision | ready | merged`. The block is
+`status` ∈ `planning | in-progress | in-review | needs-decision | ready | merged | abandoned`
+(the last two are terminal: the PR merged, or it was closed without ever merging). The block is
 delimited by `<!--FEATURE-STATE:BEGIN-->` / `<!--FEATURE-STATE:END-->` so it can be replaced
 idempotently no matter what humans add around it. Never blind-string-replace.
 
@@ -208,13 +209,22 @@ Two gaps remain, and `feature reconcile` covers both:
 
 `reconcile` is a repo-wide sweep — one paginated query for every `feature`-labelled issue, one
 aliased GraphQL query for all their PRs' states — that closes out the merged ones (recording what
-shipped, blocking problems included, honestly), repairs the reference on still-open PRs, and reports
-PRs closed *unmerged* rather than recording a merge that never happened. It touches **no git at
-all**, on purpose: the features that need it most are the oldest, whose branches and worktrees are
-long gone, and any git-dependent path (including `feature migrate`, which resolves its issue through
-`branch.<name>.feature-issue`) can no longer reach them. For the same reason it reads `pr`/`status`
-out of the state block without the usual schema check, and migrates a schema-1 block itself on the
-way to closing it out — the alternative is a permanently unreachable orphan.
+shipped, blocking problems included, honestly) and repairs the reference on still-open PRs. It
+touches **no git at all**, on purpose: the features that need it most are the oldest, whose branches
+and worktrees are long gone, and any git-dependent path (including `feature migrate`, which resolves
+its issue through `branch.<name>.feature-issue`) can no longer reach them. For the same reason it
+reads `pr`/`status` out of the state block without the usual schema check, and migrates a schema-1
+block itself on the way to closing it out — the alternative is a permanently unreachable orphan.
+
+A PR **closed without merging** is the same orphan from the other side: an open tracking issue for
+work that will never land. Those close too, at `status: abandoned` — a second terminal status, added
+because `merged` would put a claim in the permanent record that is simply false, and leaving them
+`in-review` was the status quo that produced the graveyard. The note states only what is known (the
+tracked PR closed unmerged) and says how to correct the record if the work resumed elsewhere; the
+feature's still-open problem sub-issues are *named, not closed*, since whether a finding was moot or
+pre-existing is a reviewer's call. One case is exempted: if the branch has since been re-proposed
+under a new open PR, the feature is alive, so the sweep hands back the number to `feature pr`
+instead of burying work in flight.
 
 `feature merge` additionally verifies that the PR *actually merged* before writing `merged` into the
 record, since the gate opens before the merge, not after it, and `feature status` flags a merged PR
@@ -264,7 +274,7 @@ All commands are `feature <cmd>` (or the `feature` console script).
 | `feature migrate [--branch <b>]` | The upgrade path for a repo onboarded on an older CLI: (re-)creates the workflow labels (`deferred`/`rejected` are newer than the original set, and `gh issue edit --add-label` hard-fails on a label the repo lacks) and upgrades the state block one-way. |
 | `feature gate [--branch <b>]` | Print the verdict and the next step. Exit 0 = `OPEN`, 10 = `REVIEW_AGAIN`, 20 = `NEEDS_DECISION` (1 and 2 stay "the command itself failed"). |
 | `feature merge [--branch <b>] [--force]` | Final transition: verify the gate **and that the PR actually merged**, set status `merged`, close the feature issue (or just comment, if the PR's `Closes` reference already closed it). Does not merge the PR itself. |
-| `feature reconcile [--branch <b>] [--dry-run]` | Repo-wide sweep for features the close-out never reached: closes out every feature whose PR merged, repairs the issue reference on still-open PRs, and names the ones whose PR was closed unmerged. GitHub-only (no git), so it reaches features whose branch is long deleted. |
+| `feature reconcile [--branch <b>] [--dry-run]` | Repo-wide sweep for features the close-out never reached: closes out every feature whose PR merged, closes as `abandoned` those whose PR was closed unmerged (unless the branch has a newer open PR, which it reports instead), and repairs the issue reference on still-open PRs. GitHub-only (no git), so it reaches features whose branch is long deleted. |
 | `feature sync [--branch <b>] [--stack]` | Sync the branch with its base via `git town sync` (recursive over ancestors; `--stack` for the whole stack). If the base advanced, invalidates the last review so the gate reopens and a fresh review + `review record` is required. Delegates to git-town; does not auto-resolve conflicts. |
 
 ## The in-session review

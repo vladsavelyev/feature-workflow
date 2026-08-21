@@ -37,7 +37,7 @@ config, so any session on the branch can reconstruct it.
 | Sync branch with base (recursive) | `feature sync` (or `--stack` for the whole stack) — delegates to git-town; reopens the gate if the base moved |
 | Check if safe to merge | `feature gate` — **exit 0 = OPEN (ship), 10 = REVIEW_AGAIN, 20 = NEEDS_DECISION (stop, ask the human)**; 1/2 still mean the command itself failed |
 | After merging, close out | `feature merge` — verifies the gate *and* that the PR really merged, records what shipped, closes the issue (the PR's `Closes #<issue>` reference usually beat it to the close; the record is the point) |
-| Orphaned features: PRs merged with nobody closing them out | `feature reconcile` (add `--dry-run` first) — repo-wide, git-free, works on features whose branch is long deleted |
+| Orphaned features: PRs merged (or closed unmerged) with nobody closing them out | `feature reconcile` (add `--dry-run` first) — repo-wide, git-free, works on features whose branch is long deleted. Merged → closed as `merged`; PR closed unmerged → closed as `abandoned`, unless the branch has a newer open PR, which it reports so you can `feature pr <n>` it |
 | Resume / understand a branch | `feature status` |
 | A repo/feature issue predating this CLI version | `feature migrate` — (re-)creates the workflow labels AND upgrades the state block. Run it once per repo after the CLI is upgraded; `problem defer`/`reject` abort without the newer labels. |
 
