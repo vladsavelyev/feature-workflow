@@ -36,7 +36,8 @@ config, so any session on the branch can reconstruct it.
 | Hand a non-converging loop to a human | `feature escalate --reason "<what you found + what you recommend>"` |
 | Sync branch with base (recursive) | `feature sync` (or `--stack` for the whole stack) — delegates to git-town; reopens the gate if the base moved |
 | Check if safe to merge | `feature gate` — **exit 0 = OPEN (ship), 10 = REVIEW_AGAIN, 20 = NEEDS_DECISION (stop, ask the human)**; 1/2 still mean the command itself failed |
-| After merging, close out | `feature merge` |
+| After merging, close out | `feature merge` — verifies the gate *and* that the PR really merged, records what shipped, closes the issue (the PR's `Closes #<issue>` reference usually beat it to the close; the record is the point) |
+| Orphaned features: PRs merged with nobody closing them out | `feature reconcile` (add `--dry-run` first) — repo-wide, git-free, works on features whose branch is long deleted |
 | Resume / understand a branch | `feature status` |
 | A repo/feature issue predating this CLI version | `feature migrate` — (re-)creates the workflow labels AND upgrades the state block. Run it once per repo after the CLI is upgraded; `problem defer`/`reject` abort without the newer labels. |
 
@@ -187,6 +188,13 @@ Three rules that keep this honest:
 
 - Don't hand-edit the JSON block in a feature issue — the CLI owns it.
 - The gate is advisory: it gives a green light; the human clicks merge. Don't merge for them.
+- **After the merge, close the feature out.** `feature pr` puts `Closes #<issue>` in the PR body, so
+  a merge into the default branch closes the tracking issue by itself — but the *record* still needs
+  writing (status `merged`, a comment naming the debt that shipped), and a stacked feature merged
+  into its parent doesn't auto-close at all. Run `feature merge` on the branch, or
+  `feature reconcile` to sweep every feature in the repo (it needs no branch or worktree, so it also
+  reaches ones deleted long ago). If `feature status` prints the merged-but-not-closed-out warning,
+  do this before anything else.
 - Prereqs: `gh` authenticated, `git-town` installed (for stacking). If a command aborts,
   surface the error — the CLI is deliberately fail-fast.
 - To create a stacked feature, you can run `feature create --base` from anywhere; the new

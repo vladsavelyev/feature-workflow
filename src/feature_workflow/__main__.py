@@ -386,6 +386,11 @@ def cmd_status(args: argparse.Namespace) -> None:
         return
     _, state, _ = _load_state(branch)
     triaged = _triage(issue)
+    # The PR's real state, not just its number: a merged PR whose feature never reached `merged` is
+    # the failure that left a repo full of open tracking issues for PRs merged weeks earlier, and
+    # this is the one place an agent reliably looks (the SessionStart hook prints it).
+    pr_state = github.pr_state(state["pr"]) if state["pr"] is not None else None
+    needs_close_out = pr_state == "MERGED" and state["status"] != "merged"
     rounds, pinned, rounds_why = _resolve_budget(state)
     decision = gate.evaluate(
         blocking_open=len(triaged.blocking),
@@ -403,6 +408,8 @@ def cmd_status(args: argparse.Namespace) -> None:
                     "state": state,
                     "base": parent_branch(branch) or state.get("base") or "main",
                     "worktree": worktree_for_branch(branch),
+                    "pr_state": pr_state,
+                    "needs_close_out": needs_close_out,
                     "review_budget": {"rounds": rounds, "used": decision.rounds_used, "why": rounds_why},
                     "gate": {
                         "verdict": str(decision.verdict),
@@ -423,7 +430,7 @@ def cmd_status(args: argparse.Namespace) -> None:
     print(f"Base       : {base}")
     print(f"Worktree   : {worktree or '(not checked out in any worktree)'}")
     print(f"Issue      : #{issue}")
-    print(f"PR         : {state['pr']}")
+    print(f"PR         : {state['pr']}" + (f" ({pr_state})" if pr_state else ""))
     print(f"Status     : {state['status']}")
     print(f"Last prompt: {state['last_prompt']}")
     lr = state["last_review"]
@@ -437,6 +444,11 @@ def cmd_status(args: argparse.Namespace) -> None:
     print(f"Reviews    : {decision.rounds_used}/{rounds} rounds used ({'; '.join(rounds_why)})")
     print(f"Gate       : {decision}")
     print(f"  → {decision.next_step}")
+    if needs_close_out:
+        print(
+            f"⚠️  PR #{state['pr']} is MERGED but this feature is still '{state['status']}' — "
+            f"close it out with `feature merge` (or `feature reconcile` for every such feature in the repo)."
+        )
     print(f"Blocking problems ({len(triaged.blocking)}):")
     for s in triaged.blocking:
         print(f"  #{s['number']} [{problems.severity(s)}] {s['title']}")
@@ -544,6 +556,10 @@ def cmd_migrate(args: argparse.Namespace) -> None:
     print(f"Workflow labels are up to date; migrated #{issue} state from schema {was} to {SCHEMA}.")
 
 
+def _blocking_refs(triaged: problems.Triage) -> str:
+    return ", ".join(f"#{s['number']} [{problems.severity(s)}]" for s in triaged.blocking) or "none"
+
+
 def cmd_merge(args: argparse.Namespace) -> None:
     """Final transition: verify the gate, mark merged, close the feature issue.
 
@@ -554,10 +570,25 @@ def cmd_merge(args: argparse.Namespace) -> None:
     issue, state, triaged, decision = _gate_for(branch)
     if not decision.open and not args.force:
         sys.exit(f"Refusing to close #{issue}: gate {decision}. Use --force to override.")
+    # "Merged" is a claim about the world, and this command writes it into the permanent record.
+    # Verify it instead of trusting the caller's timing: run a round too early (the gate opens
+    # *before* the merge) and the feature reads as shipped while the PR is still open — or was
+    # closed unmerged, in which case the work never landed at all.
+    if not args.force:
+        if state["pr"] is None:
+            sys.exit(
+                f"Refusing to mark #{issue} merged: no PR is linked, so nothing has merged. "
+                f"Link it with `feature pr <number>` first, or use --force if this feature shipped "
+                f"some other way."
+            )
+        pr_state = github.pr_state(state["pr"])
+        if pr_state != "MERGED":
+            sys.exit(
+                f"Refusing to mark #{issue} merged: PR #{state['pr']} is {pr_state}. `feature merge` "
+                f"records the outcome *after* the merge — merge the PR first, then re-run. "
+                f"Use --force to record it anyway."
+            )
 
-    set_status(state, "merged")
-    body = github.get_issue_body(issue)
-    _save_state(issue, body, state)
     # Name what actually shipped, derived from the triage rather than asserted. Deferred and
     # low-severity problems stay open on purpose, and on the --force path there may be blocking
     # problems too — a note claiming "no blocking problems" there would put a false statement in the
@@ -565,17 +596,152 @@ def cmd_merge(args: argparse.Namespace) -> None:
     if decision.open:
         note = f"✅ Merged. No blocking problems; {triaged.summary()}."
     else:
-        overridden = ", ".join(f"#{s['number']} [{problems.severity(s)}]" for s in triaged.blocking) or "none"
         note = (
             f"⚠️ Merged with `--force` while the gate was **{decision.verdict}** "
             f"({'; '.join(decision.reasons)}).\n\n"
-            f"Blocking problems overridden: {overridden}.\n{triaged.summary()}."
+            f"Blocking problems overridden: {_blocking_refs(triaged)}.\n{triaged.summary()}."
         )
-    github.close_issue(issue, note)
+    # The issue may already be closed: the PR's `Closes #<issue>` reference fires the moment it
+    # merges into the default branch, which is usually seconds before anyone runs this. Comment
+    # either way, close only if it's still open.
+    _record_merged(issue, state, note, already_closed=github.get_issue(issue)["state"] != "OPEN")
     print(f"Marked feature #{issue} merged and closed it.")
     print(f"  {triaged.summary()}")
     if not decision.open:
         print(f"  overridden with --force: {len(triaged.blocking)} blocking problem(s) still open")
+
+
+def _record_merged(issue: int, state: dict, note: str, *, already_closed: bool) -> None:
+    """Post the outcome, close the issue, then write `status: merged` — in that order.
+
+    ORDER IS THE RETRY STRATEGY, as in `review record`: the state write goes last, so a failure to
+    comment or close leaves the feature un-merged in the state block and a re-run does the whole
+    thing again (a duplicated timeline comment is harmless; a feature marked merged whose issue is
+    still open would be skipped by every future `feature reconcile` — permanently orphaned).
+    """
+    if already_closed:
+        github.comment(issue, note)
+    else:
+        github.close_issue(issue, note)
+    set_status(state, "merged")
+    # Re-read the body: it was fetched before several network calls, and writing a stale copy back
+    # would silently revert any human edit to the prose around the state block.
+    _save_state(issue, github.get_issue_body(issue), state)
+
+
+def _reconcile_note(pr: int, triaged: problems.Triage) -> str:
+    if triaged.blocking:
+        return (
+            f"✅ Merged in PR #{pr} — recorded after the fact by `feature reconcile`.\n\n"
+            f"⚠️ {len(triaged.blocking)} blocking problem(s) were still open when it merged: "
+            f"{_blocking_refs(triaged)}. The gate either never opened or was bypassed outside this "
+            f"CLI; this comment is the record of what actually shipped.\n{triaged.summary()}."
+        )
+    return f"✅ Merged in PR #{pr} — recorded after the fact by `feature reconcile`. {triaged.summary()}."
+
+
+def cmd_reconcile(args: argparse.Namespace) -> None:
+    """Sweep the repo for features whose PR merged without anyone running `feature merge`.
+
+    This exists because the close-out step was, for its whole life, something a human had to
+    remember *after* clicking merge in the GitHub UI — by which point the PR is out of sight and the
+    branch is deleted, so no later session ever visits the feature again. One repo reached 12 open
+    tracking issues whose PRs had merged weeks earlier, each still claiming `in-review`. PR bodies
+    now carry a `Closes #<issue>` reference so GitHub closes the issue on merge, but that only fires
+    for merges into the default branch (never for a stacked feature merged into its parent) and it
+    writes no record — the state block stays at `in-review` and nothing names the debt that shipped.
+
+    Deliberately git-free: it reads GitHub only, so it works from any checkout long after the
+    feature's branch and worktree are gone. It also repairs the link on still-open PRs, which is
+    what stops tomorrow's merges from orphaning anything.
+    """
+    rows = [github.get_issue(_resolve_issue(args.branch))] if args.branch else github.feature_issues()
+
+    unreadable: list[tuple[int, str]] = []
+    pending: list[tuple[dict, dict]] = []  # (issue row, state block)
+    for row in rows:
+        try:
+            state = parse_block_raw(row["body"])
+        except ValueError as exc:
+            # Reported and non-zero at the end, never skipped silently: a `feature`-labelled issue
+            # whose state block is missing or hand-mangled is exactly the thing that would otherwise
+            # sit orphaned while the sweep claimed success.
+            unreadable.append((row["number"], str(exc)))
+            continue
+        # Read `pr` and `status` — the two fields every schema has carried — WITHOUT the usual
+        # schema check, because the features that need this sweep most are the oldest ones, whose
+        # branches are long deleted: `feature migrate` resolves its issue through the branch's git
+        # config, so it cannot reach them at all, and refusing to read them here would leave them
+        # permanently orphaned. A schema this CLI has never written is still refused (those fields
+        # could mean anything), and nothing is written back until the block has been migrated.
+        if state.get("schema") not in (1, SCHEMA):
+            unreadable.append((row["number"], f"state block has unknown schema {state.get('schema')!r}"))
+            continue
+        if state.get("pr") is not None and state.get("status") != "merged":
+            pending.append((row, state))
+
+    states = github.pr_states([state["pr"] for _, state in pending])
+    closed_out, relinked, abandoned = 0, 0, 0
+    for row, state in pending:
+        issue, pr = row["number"], state["pr"]
+        pr_state = states[pr]
+        if pr_state == "OPEN":
+            # Still in flight. Upgrade its reference if it predates the closing link (or was never
+            # linked), so this one closes itself on merge. Its state block is left alone even if
+            # stale: a live feature is reachable from its own branch, where `feature migrate` can
+            # upgrade it loudly and the gate can be re-derived.
+            stale = "" if state["schema"] == SCHEMA else f" (state is schema {state['schema']}; run `feature migrate`)"
+            if args.dry_run:
+                # Whether the body actually needs an edit is only knowable by reading it, which is
+                # what the real run does — don't claim a count here that a dry run can't know.
+                print(f"#{issue} ({row['title']}): PR #{pr} open → reference repaired if stale{stale}")
+            elif github.link_pr_to_feature(pr, issue):
+                print(f"#{issue} ({row['title']}): re-linked — PR #{pr} now closes it on merge{stale}")
+                relinked += 1
+            continue
+        if pr_state == "CLOSED":
+            # Closed unmerged: the work never landed, so closing the feature issue would record a
+            # merge that didn't happen. A human decides — reopen the PR, or close the issue as
+            # abandoned with a reason.
+            print(
+                f"#{issue} ({row['title']}): PR #{pr} was CLOSED without merging, "
+                f"status '{state['status']}' — decide by hand"
+            )
+            abandoned += 1
+            continue
+        triaged = _triage(issue)
+        upgrade = "" if state["schema"] == SCHEMA else f" + state upgraded from schema {state['schema']}"
+        if args.dry_run:
+            print(
+                f"#{issue} ({row['title']}): PR #{pr} MERGED, status '{state['status']}' → "
+                f"would close out{upgrade}. {triaged.summary()}"
+            )
+            closed_out += 1
+            continue
+        if state["schema"] != SCHEMA:
+            # It merged, so the review budget and convergence trend the migration reconstructs no
+            # longer decide anything — but the block still has to be readable by every later command.
+            try:
+                state = migrate(state)
+            except ValueError as exc:
+                unreadable.append((issue, f"could not migrate its schema-{state['schema']} state block: {exc}"))
+                continue
+        _record_merged(issue, state, _reconcile_note(pr, triaged), already_closed=row["state"] != "OPEN")
+        blocking = f"; {len(triaged.blocking)} blocking problem(s) shipped open" if triaged.blocking else ""
+        print(f"#{issue} ({row['title']}): closed out — merged in PR #{pr}{upgrade}{blocking}")
+        closed_out += 1
+
+    scope = f"feature for branch '{args.branch}'" if args.branch else f"{len(rows)} feature issue(s)"
+    tail = "" if args.dry_run else f", re-linked {relinked}"
+    print(
+        f"Scanned {scope}: {'would close out' if args.dry_run else 'closed out'} {closed_out}"
+        f"{tail}, {abandoned} needing a human decision."
+    )
+    if unreadable:
+        print(f"\n{len(unreadable)} feature issue(s) could not be reconciled:")
+        for number, why in unreadable:
+            print(f"  #{number}: {why}")
+        sys.exit("Fix those by hand (the state block is in the issue body) and re-run.")
 
 
 def cmd_sync(args: argparse.Namespace) -> None:
@@ -741,10 +907,18 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--branch")
     c.set_defaults(func=cmd_migrate)
 
-    c = sub.add_parser("merge", help="Mark feature merged and close its issue (checks gate)")
+    c = sub.add_parser("merge", help="Mark feature merged and close its issue (checks gate + that the PR merged)")
     c.add_argument("--branch")
-    c.add_argument("--force", action="store_true", help="Close even if the gate is closed")
+    c.add_argument("--force", action="store_true", help="Record it even if the gate is closed or the PR isn't merged")
     c.set_defaults(func=cmd_merge)
+
+    c = sub.add_parser(
+        "reconcile",
+        help="Close out every feature whose PR already merged, and repair the link on still-open PRs",
+    )
+    c.add_argument("--branch", help="Only this branch's feature (default: every feature issue in the repo)")
+    c.add_argument("--dry-run", action="store_true", help="Report what would change; write nothing")
+    c.set_defaults(func=cmd_reconcile)
 
     c = sub.add_parser("sync", help="Sync branch with base via git-town; reopens the gate if base moved")
     c.add_argument("--branch")

@@ -182,6 +182,44 @@ The gate is still a pure query: `feature gate` never mutates state. Parking a fe
 `needs-decision` is an explicit act — `feature escalate --reason "…"` — which posts the current gate
 state and the agent's recommendation to the tracking issue.
 
+### Closing the loop after the merge
+
+The tracking issue must close when the work lands, and the *only* mechanism for that was
+`feature merge` — a command a human runs **after** clicking merge in the GitHub UI, by which point
+the PR has left the screen and the branch is deleted. It was skipped essentially every time: the
+first repo to use this workflow reached 17 open tracking issues whose PRs had merged, some weeks
+earlier, all still claiming `in-review`. A step that depends on remembering, at the one moment
+attention has moved on, is not a mechanism.
+
+So the linkage is now GitHub-native and self-firing: `feature pr` writes `Closes #<issue>` into the
+PR body (marked with an invisible `<!-- feature-workflow -->` comment so it can never be confused
+with the PR's own hand-written `Closes #<problem>` lines, which re-linking must not disturb), and
+merging closes the tracking issue with nobody in the loop. The original design chose a non-closing
+`Part of #<issue>` deliberately — the umbrella issue outlives the PR, and its problem sub-issues can
+still be open — but "closed with open children" is a state GitHub renders fine, and a closed issue
+whose debt is a sub-issue list beats an open issue nobody reads.
+
+Two gaps remain, and `feature reconcile` covers both:
+
+- GitHub only honours the keyword on a merge into the **default branch**, so a stacked feature
+  merged into its parent never auto-closes.
+- The auto-close writes no *record*: the state block stays at `in-review`, and nothing names the
+  debt that shipped.
+
+`reconcile` is a repo-wide sweep — one paginated query for every `feature`-labelled issue, one
+aliased GraphQL query for all their PRs' states — that closes out the merged ones (recording what
+shipped, blocking problems included, honestly), repairs the reference on still-open PRs, and reports
+PRs closed *unmerged* rather than recording a merge that never happened. It touches **no git at
+all**, on purpose: the features that need it most are the oldest, whose branches and worktrees are
+long gone, and any git-dependent path (including `feature migrate`, which resolves its issue through
+`branch.<name>.feature-issue`) can no longer reach them. For the same reason it reads `pr`/`status`
+out of the state block without the usual schema check, and migrates a schema-1 block itself on the
+way to closing it out — the alternative is a permanently unreachable orphan.
+
+`feature merge` additionally verifies that the PR *actually merged* before writing `merged` into the
+record, since the gate opens before the merge, not after it, and `feature status` flags a merged PR
+whose feature never closed out — which puts the reminder in front of the next session on the branch.
+
 ## Session bootstrap
 
 A `SessionStart` hook runs `feature status` for the current branch and injects the result into
@@ -225,7 +263,8 @@ All commands are `feature <cmd>` (or the `feature` console script).
 | `feature escalate --reason <text> [--branch <b>]` | Park the feature at `needs-decision` and post the gate state + your recommendation for a human. |
 | `feature migrate [--branch <b>]` | The upgrade path for a repo onboarded on an older CLI: (re-)creates the workflow labels (`deferred`/`rejected` are newer than the original set, and `gh issue edit --add-label` hard-fails on a label the repo lacks) and upgrades the state block one-way. |
 | `feature gate [--branch <b>]` | Print the verdict and the next step. Exit 0 = `OPEN`, 10 = `REVIEW_AGAIN`, 20 = `NEEDS_DECISION` (1 and 2 stay "the command itself failed"). |
-| `feature merge [--branch <b>] [--force]` | Final transition: verify the gate, set status `merged`, close the feature issue. Does not merge the PR itself. |
+| `feature merge [--branch <b>] [--force]` | Final transition: verify the gate **and that the PR actually merged**, set status `merged`, close the feature issue (or just comment, if the PR's `Closes` reference already closed it). Does not merge the PR itself. |
+| `feature reconcile [--branch <b>] [--dry-run]` | Repo-wide sweep for features the close-out never reached: closes out every feature whose PR merged, repairs the issue reference on still-open PRs, and names the ones whose PR was closed unmerged. GitHub-only (no git), so it reaches features whose branch is long deleted. |
 | `feature sync [--branch <b>] [--stack]` | Sync the branch with its base via `git town sync` (recursive over ancestors; `--stack` for the whole stack). If the base advanced, invalidates the last review so the gate reopens and a fresh review + `review record` is required. Delegates to git-town; does not auto-resolve conflicts. |
 
 ## The in-session review

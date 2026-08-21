@@ -93,26 +93,96 @@ def open_pr_for_branch(branch: str) -> int | None:
     return int(out) if out else None
 
 
-_FEATURE_REF_RE = re.compile(r"(?mi)^Part of #\d+\s*$")
+# The marker makes the line unmistakably *ours*. A PR body legitimately carries hand-written
+# closing references to the problem sub-issues it fixes ("Closes #2173, #2174"), and one of those
+# can be a lone `Closes #2173` on its own line — indistinguishable from the feature reference
+# without this, so re-linking would strip it and silently stop that problem from auto-closing.
+# Invisible when rendered, and GitHub still parses the keyword reference that precedes it.
+_REF_MARK = "<!-- feature-workflow -->"
+# Our own reference line, in either form: the current closing one, or the non-closing `Part of #…`
+# that PRs opened before this changed still carry (upgraded in place on the next link).
+_FEATURE_REF_RE = re.compile(rf"(?mi)^(?:Closes #\d+ {re.escape(_REF_MARK)}|Part of #\d+)\s*$")
+
+
+def feature_ref(issue: int) -> str:
+    """The reference line this workflow writes into a PR body to link it to its feature issue."""
+    return f"Closes #{issue} {_REF_MARK}"
 
 
 def link_pr_to_feature(pr: int, issue: int) -> bool:
-    """Add a native `Part of #<issue>` reference to the PR body, creating a real GitHub link
-    that shows in the PR's sidebar and the issue's timeline. Returns True if the body changed.
+    """Put a native `Closes #<issue>` reference in the PR body, creating a real GitHub link that
+    shows in the PR's sidebar and closes the tracking issue when the PR merges. Returns True if
+    the body changed.
 
-    Non-closing on purpose: the feature (umbrella) issue outlives the PR — it's closed by
-    `feature merge` once the gate is clean, not automatically when the PR merges. A `Closes`
-    keyword would wrongly auto-close the tracking issue (and all its still-open problem
-    sub-issues stay open). We strip any stale `Part of #…` line first so re-linking to a
-    different issue doesn't leave two references behind.
+    This used to be a deliberately non-closing `Part of #<issue>`, on the theory that the feature
+    issue outlives the PR and should be closed by `feature merge` once the gate is clean. In
+    practice that theory produced a graveyard: `feature merge` is a step a human has to remember
+    *after* clicking merge in the GitHub UI, by which point the PR is gone from view and the branch
+    is deleted, so nobody ever ran it — one repo reached 12 open tracking issues whose PRs had
+    merged weeks earlier. A closing keyword needs nobody to remember anything.
+
+    Two gaps remain, and `feature reconcile` exists for both: GitHub only honours the keyword when
+    the PR merges into the **default branch**, so a stacked feature merged into its parent still
+    needs closing by hand, and the auto-close writes no record — the state block stays at
+    `in-review` and nothing names the debt that shipped.
+
+    Any stale reference line of ours is stripped first, so re-linking (or upgrading an old
+    `Part of #…`) replaces the reference instead of stacking a second one.
     """
     body = run(["gh", "pr", "view", str(pr), "--json", "body", "--jq", ".body"])
-    if re.search(rf"(?mi)^Part of #{issue}\s*$", body):
+    ref = feature_ref(issue)
+    if any(line.strip() == ref for line in body.splitlines()):
         return False  # already linked to this issue
     stripped = _FEATURE_REF_RE.sub("", body).rstrip()
-    new_body = f"{stripped}\n\nPart of #{issue}\n" if stripped else f"Part of #{issue}\n"
+    new_body = f"{stripped}\n\n{ref}\n" if stripped else f"{ref}\n"
     run(["gh", "pr", "edit", str(pr), "--body-file", "-"], input_text=new_body)
     return True
+
+
+# How many PRs to ask about per aliased GraphQL query. Well under any complexity limit, and it
+# keeps a repo with hundreds of tracked features to a handful of round trips.
+_PR_BATCH = 50
+
+
+def pr_states(numbers: list[int]) -> dict[int, str]:
+    """Map PR number → `OPEN` | `MERGED` | `CLOSED`, batched into aliased GraphQL queries.
+
+    Batched because the reconcile sweep asks about every tracked feature at once, and a
+    `gh pr view` per PR turns a one-second command into a minute of round trips. A number with no
+    such PR makes the whole query fail (GraphQL reports it as an error) rather than reading as an
+    absent PR — a state block pointing at a PR that doesn't exist is corruption, not a normal case.
+    """
+    unique = sorted({int(n) for n in numbers})
+    if not unique:
+        return {}  # nothing to ask about; don't even resolve the repo
+    owner, name = _owner_repo()
+    states: dict[int, str] = {}
+    for start in range(0, len(unique), _PR_BATCH):
+        fields = " ".join(f"p{n}: pullRequest(number:{n}){{number state}}" for n in unique[start : start + _PR_BATCH])
+        q = f"query($o:String!,$r:String!){{repository(owner:$o,name:$r){{{fields}}}}}"
+        out = run(
+            [
+                "gh",
+                "api",
+                "graphql",
+                "-f",
+                f"query={q}",
+                "-f",
+                f"o={owner}",
+                "-f",
+                f"r={name}",
+                "--jq",
+                ".data.repository",
+            ]
+        )
+        for pr in json.loads(out).values():
+            states[pr["number"]] = pr["state"]
+    return states
+
+
+def pr_state(number: int) -> str:
+    """`OPEN` | `MERGED` | `CLOSED` for a single PR."""
+    return pr_states([number])[number]
 
 
 def pr_base_branch(number: int) -> str:
@@ -164,6 +234,51 @@ def remove_label(number: int, label: str) -> None:
 
 def get_issue_body(number: int) -> str:
     return run(["gh", "issue", "view", str(number), "--json", "body", "--jq", ".body"])
+
+
+def get_issue(number: int) -> dict:
+    """{number, title, state, body} for one issue — the same shape `feature_issues` yields, so a
+    single-feature reconcile runs through the same code as the repo-wide sweep."""
+    return json.loads(run(["gh", "issue", "view", str(number), "--json", "number,title,state,body"]))
+
+
+def feature_issues() -> list[dict]:
+    """[{number, title, state, body}] for every `feature`-labelled issue in the repo.
+
+    Closed ones included: a merged PR now closes its tracking issue through the `Closes` reference,
+    and the reconcile sweep still has to find that issue to write the outcome into its state block.
+    Paginated for the same reason `sub_issues` is — a repo accumulates features for as long as it
+    uses this workflow, and a sweep that silently stops at 100 would leave the oldest ones orphaned
+    forever.
+    """
+    owner, name = _owner_repo()
+    q = (
+        "query($o:String!,$r:String!,$endCursor:String){repository(owner:$o,name:$r)"
+        '{issues(first:50,labels:["feature"],after:$endCursor){'
+        "pageInfo{hasNextPage,endCursor} nodes{number title state body}}}}"
+    )
+    out = run(
+        [
+            "gh",
+            "api",
+            "graphql",
+            "--paginate",
+            "-f",
+            f"query={q}",
+            "-f",
+            f"o={owner}",
+            "-f",
+            f"r={name}",
+            "--jq",
+            ".data.repository.issues.nodes",
+        ]
+    )
+    issues: list[dict] = []
+    for page in out.splitlines():
+        page = page.strip()
+        if page:
+            issues.extend(json.loads(page))
+    return issues
 
 
 def set_issue_body(number: int, body: str) -> None:

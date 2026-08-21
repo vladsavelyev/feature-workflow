@@ -75,6 +75,14 @@ def main() -> None:
         "(finder subagent → dedup → `feature problem add` → `feature review record`), NOT a "
         "standalone code reviewer and NOT a search for a project-local `code-review` skill."
     )
+    # A merged PR whose feature never closed out is the one state where the gate's advice is moot,
+    # and the branch you're on is the last place anyone will notice — after this session it gets
+    # deleted and the tracking issue is orphaned for good. Say so before the review instructions.
+    print(
+        "If the status above warns that the PR is MERGED but the feature was never closed out, do "
+        "that FIRST: `feature merge` (or `feature reconcile` to sweep the whole repo). Reviewing a "
+        "merged feature is not useful; recording what shipped is."
+    )
     # The gate line above already says what to do; make the stop condition explicit, because the
     # failure mode this replaced was an agent reviewing round after round chasing a clean sweep.
     print(

@@ -99,8 +99,31 @@ feature adopt --init-labels
 | `feature status [--branch <b>] [--json]` | Reconstruct and print feature state. |
 | `feature sync [--branch <b>] [--stack]` | Sync the branch with its base via git-town; if the base advanced, invalidates the last review so the gate reopens. |
 | `feature gate [--branch <b>]` | Exit 0 = OPEN, 10 = REVIEW_AGAIN, 20 = NEEDS_DECISION (1 and 2 stay "the command failed"). |
-| `feature merge [--branch <b>] [--force]` | Mark merged and close the issue (checks gate; names the debt that ships). |
+| `feature merge [--branch <b>] [--force]` | Mark merged and close the issue (checks the gate *and* that the PR really merged; names the debt that ships). |
+| `feature reconcile [--branch <b>] [--dry-run]` | Sweep the repo: close out every feature whose PR already merged, repair the issue link on still-open PRs, and name the ones whose PR was closed unmerged. |
 | `feature migrate [--branch <b>]` | Upgrade a repo for this CLI version: (re-)create the workflow labels and the feature issue's state block. Run it once per repo after upgrading. |
+
+## PR ↔ issue linkage
+
+`feature pr` writes a `Closes #<issue>` reference into the PR body, so **merging the PR closes the
+tracking issue** with nobody having to remember a follow-up command. It used to write a
+non-closing `Part of #<issue>` on the theory that the umbrella issue should outlive its PR and be
+closed deliberately by `feature merge` — in practice that step happens after the merge button, when
+the PR has left the screen and the branch is deleted, so it was skipped essentially every time and
+tracking issues accumulated open for PRs merged weeks earlier.
+
+The keyword covers the common case but not all of it: GitHub only auto-closes on a merge into the
+**default branch** (never for a stacked feature merged into its parent), and it writes no record —
+the state block would stay at `in-review` and nothing would name the debt that shipped. So:
+
+```sh
+feature reconcile --dry-run   # what's orphaned: merged PRs, stale links, PRs closed unmerged
+feature reconcile             # close them out, record the outcome, repair open PRs' links
+```
+
+`reconcile` reads GitHub only — no git, no branch, no worktree — so it works on features whose
+branch was deleted months ago. `feature status` also flags a merged PR whose feature never closed
+out, which puts the reminder in front of the next session on that branch.
 
 ## SessionStart hook
 
