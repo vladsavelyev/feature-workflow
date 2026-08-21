@@ -183,6 +183,11 @@ Three rules that keep this honest:
 - **Never `feature merge --force`** to get around a closed gate. Escalate; the human decides.
 - **Deferred and low problems stay OPEN on purpose** and are listed in the merge comment. Debt you
   can't see isn't tracked.
+- **Close fixed problems with `feature problem resolve <#> --commit <sha>`, not with a `Closes`
+  line in the PR body.** GitHub needs the keyword repeated before *every* number: `Closes #10, #11,
+  #12` links only #10, so the rest stay open (silently — the PR reads as if it closed them all) and
+  keep holding the gate. This is a real observed failure: one PR listing nine fixed problems that
+  way closed exactly one of them.
 
 ## Rules
 
