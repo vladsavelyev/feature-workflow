@@ -41,11 +41,34 @@ config, so any session on the branch can reconstruct it.
 | Resume / understand a branch | `feature status` |
 | A repo/feature issue predating this CLI version | `feature migrate` — (re-)creates the workflow labels AND upgrades the state block. Run it once per repo after the CLI is upgraded; `problem defer`/`reject` abort without the newer labels. |
 
+## Work from the feature's worktree, not the main checkout
+
+The worktree lives *under* the MAIN checkout (`.claude/worktrees/<name>/`), so the main checkout's
+path is a prefix of it and holds the SAME files on a DIFFERENT branch (the base). Editing from the
+main checkout silently edits the base branch. A `cd` in a shell command does not fix this — the
+session's working directory, `CLAUDE.md` resolution and hooks stay where they were.
+
+So **immediately after `feature create`, switch the session into the new worktree with the
+`EnterWorktree` tool**, passing `path:` = the `worktree` path the command printed. This counts as
+the explicit project instruction that `EnterWorktree`'s "only when asked" caveat requires.
+
+- Pass `path:`, never `name:` — the worktree already exists; `name:` would create a second one.
+- It works both from the main checkout and from another feature's worktree, because `feature
+  create` always places worktrees under the main checkout's `.claude/worktrees/`. A worktree
+  somewhere else (`/tmp`, a sibling of the repo) is rejected when switching out of a worktree, so
+  leave placement to the CLI.
+- Entering with `path:` can never delete the worktree — `ExitWorktree` refuses to remove one it
+  didn't create; leave with `action: "keep"` and the branch survives.
+
 ## Starting a session on an existing branch
 
 FIRST run `feature status`. It prints the base branch, PR, last prompt, last review result,
 and open problems — everything you need to resume. If a SessionStart hook is wired
 (`feature-session-context`), this is injected automatically; otherwise run it yourself.
+
+If the `Worktree` it prints is not the directory you are standing in, `EnterWorktree` with that
+`path` before touching any code — resuming from the main checkout is the most common way to end up
+editing the base branch by mistake (see the section above).
 
 ## Reviewing a feature (the core workflow)
 
@@ -204,4 +227,5 @@ Three rules that keep this honest:
   surface the error — the CLI is deliberately fail-fast.
 - To create a stacked feature, you can run `feature create --base` from anywhere; the new
   worktree is placed under the MAIN checkout's `.claude/worktrees/`, not nested in the current
-  one.
+  one. Then `EnterWorktree` into it, as after any `create` — see "Work from the feature's
+  worktree" above.
