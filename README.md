@@ -1,5 +1,7 @@
 # ship
 
+> **Moved.** ship now lives in [vladsavelyev/skills](https://github.com/vladsavelyev/skills/tree/main/plugins/ship) as `plugins/ship`, with its history. This repo is archived.
+
 A CLI + SessionStart hook for running multiple Claude features in parallel: each feature gets
 a branch, a worktree, a PR, and a GitHub tracking issue. Features can be **stacked** on each
 other (via git-town). Review-found problems are tracked as GitHub sub-issues, and a **merge
